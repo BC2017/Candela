@@ -56,7 +56,7 @@ struct FrameConstants
     float4 sunColor;          // rgb
     uint pointLightCount;
     uint pad0, pad1, pad2;
-    PointLight pointLights[8];
+    PointLight pointLights[64];
     uint rtFlags;             // kRT* bits
     uint tlasSlot;
     uint pad3, pad4;

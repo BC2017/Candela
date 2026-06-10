@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
     std::filesystem::path modelPath; // view a single model instead of a scene
     bool noRT = false;               // isolate raster path (debugging aid)
     std::filesystem::path flythroughDir; // capture a camera-path PNG sequence
+    bool benchmark = false; // dense stress scene + frame-time report
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -86,6 +87,8 @@ int main(int argc, char** argv) {
             noRT = true;
         } else if (std::strcmp(argv[i], "--flythrough") == 0 && i + 1 < argc) {
             flythroughDir = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--benchmark") == 0) {
+            benchmark = true;
         }
     }
 
@@ -114,7 +117,67 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path scenePath =
             assetDir / "scenes" / "sponza.candela";
-        if (!modelPath.empty()) {
+        if (benchmark) {
+            // Stress scene: Sponza plus a two-deck grid of DamagedHelmets
+            // (~19M visible triangles, 130 TLAS instances) and 48 colored
+            // point lights — every light is a shadow-ray loop in the RT path.
+            const candela::AssetGuid sponza = assets.guidForPath(
+                assetDir / "Sponza" / "glTF" / "Sponza.gltf");
+            const candela::AssetGuid helmet = assets.guidForPath(
+                assetDir / "DamagedHelmet" / "glTF" / "DamagedHelmet.gltf");
+            if (sponza == candela::kInvalidGuid ||
+                helmet == candela::kInvalidGuid) {
+                CD_ERROR("Benchmark needs Sponza and DamagedHelmet — run "
+                         "scripts/get-assets.ps1");
+                return 1;
+            }
+            world.instantiateModel(assets, sponza);
+            uint32_t helmets = 0;
+            for (int layer = 0; layer < 4; ++layer) {
+                for (int x = 0; x < 40; ++x) {
+                    for (int z = 0; z < 6; ++z) {
+                        const auto entities =
+                            world.instantiateModel(assets, helmet);
+                        auto& t = world.registry.get<candela::LocalTransform>(
+                            entities.front());
+                        t.translation = {
+                            -8.6f + 0.44f * static_cast<float>(x),
+                            1.0f + 2.0f * static_cast<float>(layer),
+                            -1.35f + 0.55f * static_cast<float>(z)};
+                        t.scale = glm::vec3(0.40f);
+                        t.rotation = glm::angleAxis(
+                            glm::radians(static_cast<float>(
+                                (x * 7 + z * 13 + layer * 29) % 360)),
+                            glm::vec3(0.0f, 1.0f, 0.0f));
+                        ++helmets;
+                    }
+                }
+            }
+            for (int i = 0; i < 64; ++i) {
+                const entt::entity light =
+                    world.createEntity("bench_light_" + std::to_string(i));
+                auto& t = world.registry.get<candela::LocalTransform>(light);
+                t.translation = {-8.5f + 0.27f * static_cast<float>(i),
+                                 1.0f + 2.2f * static_cast<float>(i % 4),
+                                 (i % 2 == 0) ? -1.2f : 1.2f};
+                candela::PointLightComponent point;
+                point.radius = 6.0f;
+                point.intensity = 3.0f;
+                point.color = {
+                    0.5f + 0.5f * std::sin(0.41f * static_cast<float>(i)),
+                    0.5f + 0.5f * std::sin(0.67f * static_cast<float>(i) + 2.1f),
+                    0.5f + 0.5f * std::sin(0.93f * static_cast<float>(i) + 4.2f)};
+                world.registry.emplace<candela::PointLightComponent>(light,
+                                                                     point);
+            }
+            world.updateTransforms();
+            const std::filesystem::path benchPath =
+                assetDir / "scenes" / "benchmark.candela";
+            std::filesystem::create_directories(benchPath.parent_path());
+            candela::SceneSerializer::save(world, benchPath);
+            CD_INFO("Benchmark scene: {} helmets, 64 lights (saved {})",
+                    helmets, benchPath.string());
+        } else if (!modelPath.empty()) {
             // Model-viewer mode: one model, default sun + IBL, auto-framed.
             const candela::AssetGuid guid =
                 assets.guidForPath(std::filesystem::absolute(modelPath));
@@ -208,6 +271,13 @@ int main(int argc, char** argv) {
             std::filesystem::create_directories(flythroughDir);
             maxFrames = kFlythroughWarmup + kFlythroughFrames;
         }
+        // The benchmark flies the same path (without writing PNGs),
+        // collecting frame times after the warmup.
+        if (benchmark && maxFrames == 0) {
+            maxFrames = kFlythroughWarmup + kFlythroughFrames;
+        }
+        std::vector<float> benchTimesMs;
+        benchTimesMs.reserve(kFlythroughFrames);
 
         uint64_t frameCount = 0;
         uint32_t framesThisSecond = 0;
@@ -223,7 +293,7 @@ int main(int argc, char** argv) {
             lastFrameTime = now;
 
             assets.update();
-            if (flythroughDir.empty()) {
+            if (flythroughDir.empty() && !benchmark) {
                 camera.update(window, input, dt);
             } else if (frameCount >= kFlythroughWarmup) {
                 // Drive the camera along the spline, looking down the
@@ -239,10 +309,15 @@ int main(int argc, char** argv) {
                 camera.position = position;
                 camera.pitchRadians = std::asin(glm::clamp(dir.y, -1.0f, 1.0f));
                 camera.yawRadians = std::atan2(-dir.x, -dir.z);
-                char name[32];
-                std::snprintf(name, sizeof(name), "frame_%05llu.png",
-                              static_cast<unsigned long long>(frame));
-                renderer.requestScreenshot(flythroughDir / name);
+                if (!flythroughDir.empty()) {
+                    char name[32];
+                    std::snprintf(name, sizeof(name), "frame_%05llu.png",
+                                  static_cast<unsigned long long>(frame));
+                    renderer.requestScreenshot(flythroughDir / name);
+                }
+                if (benchmark) {
+                    benchTimesMs.push_back(dt * 1000.0f);
+                }
             } else {
                 // Warmup parked at the path start so history converges there.
                 camera.position = flyPoints[1];
@@ -285,6 +360,32 @@ int main(int argc, char** argv) {
                 stats.drawCalls, stats.culledDraws,
                 static_cast<double>(stats.triangles) / 1e6,
                 static_cast<double>(stats.gpuTotalMs));
+        if (benchmark && benchTimesMs.size() > 10) {
+            std::sort(benchTimesMs.begin(), benchTimesMs.end());
+            const auto at = [&](double q) {
+                return benchTimesMs[static_cast<size_t>(
+                    q * static_cast<double>(benchTimesMs.size() - 1))];
+            };
+            float sum = 0.0f;
+            for (const float ms : benchTimesMs) {
+                sum += ms;
+            }
+            const float average =
+                sum / static_cast<float>(benchTimesMs.size());
+            CD_INFO("Benchmark ({} frames): avg {:.2f} ms ({:.0f} fps) | "
+                    "p50 {:.2f} | p95 {:.2f} | max {:.2f} ms",
+                    benchTimesMs.size(), average, 1000.0f / average, at(0.5),
+                    at(0.95), at(1.0));
+            CD_INFO("Benchmark scene: {} draws + {} culled, {:.2f}M visible "
+                    "tris, {} TLAS instances, {} lights",
+                    stats.drawCalls, stats.culledDraws,
+                    static_cast<double>(stats.triangles) / 1e6,
+                    stats.rtInstances, stats.pointLights);
+            for (const candela::GpuPassTiming& pass : stats.gpuPasses) {
+                CD_INFO("  GPU {:>16}: {:.3f} ms", pass.name,
+                        pass.milliseconds);
+            }
+        }
         CD_INFO("Shutting down after {} frames", frameCount);
     }
 

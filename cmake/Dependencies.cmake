@@ -109,6 +109,8 @@ target_include_directories(candela_imgui PUBLIC
 target_compile_definitions(candela_imgui PUBLIC
   IMGUI_IMPL_VULKAN_USE_VOLK
   VK_NO_PROTOTYPES
+  # The editor loads its UI font from ImGui's bundled fonts.
+  CANDELA_IMGUI_FONT_DIR="${imgui_SOURCE_DIR}/misc/fonts"
 )
 target_link_libraries(candela_imgui PUBLIC volk::volk glfw)
 
