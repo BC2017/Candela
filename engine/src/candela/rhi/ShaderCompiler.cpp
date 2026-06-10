@@ -25,6 +25,34 @@ std::string readTextFile(const std::filesystem::path& path) {
             std::istreambuf_iterator<char>()};
 }
 
+uint64_t fnv1aBytes(const void* data, size_t byteCount,
+                    uint64_t hash = 14695981039346656037ull) {
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < byteCount; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+// Content hash over every .slang file in the directory — any of them can be
+// #included by any other, so this is the conservative invalidation unit
+// (mirrors ShaderCache::invalidateAll for hot reload).
+uint64_t hashShaderDirectory(const std::filesystem::path& dir) {
+    uint64_t hash = 14695981039346656037ull;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (entry.path().extension() != ".slang") {
+            continue;
+        }
+        const std::string name = entry.path().filename().string();
+        hash = fnv1aBytes(name.data(), name.size(), hash);
+        const std::string text = readTextFile(entry.path());
+        hash = fnv1aBytes(text.data(), text.size(), hash);
+    }
+    return hash;
+}
+
 } // namespace
 
 ShaderCompiler::ShaderCompiler() {
@@ -37,6 +65,16 @@ ShaderCompiler::ShaderCompiler() {
 
     m_outputDir = std::filesystem::temp_directory_path() / "candela-shaders";
     std::filesystem::create_directories(m_outputDir);
+
+    // Persistent SPIR-V cache: a warm start skips the slangc subprocess
+    // entirely (the dominant startup cost).
+    if (const char* localAppData = std::getenv("LOCALAPPDATA")) {
+        m_cacheDir = std::filesystem::path(localAppData) / "Candela" /
+                     "shader-cache";
+    } else {
+        m_cacheDir = m_outputDir / "cache";
+    }
+    std::filesystem::create_directories(m_cacheDir);
 }
 
 std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
@@ -45,6 +83,26 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
     const std::string baseName = sourcePath.stem().string() + "." + entry;
     const std::filesystem::path spvPath = m_outputDir / (baseName + ".spv");
     const std::filesystem::path errPath = m_outputDir / (baseName + ".log");
+
+    // Disk cache lookup: keyed by entry+stage+the shader directory contents.
+    const std::string keySource = sourcePath.filename().string() + "|" +
+                                  entry + "|" + stageName(stage);
+    uint64_t cacheKey = hashShaderDirectory(sourcePath.parent_path());
+    cacheKey = fnv1aBytes(keySource.data(), keySource.size(), cacheKey);
+    char keyHex[20];
+    std::snprintf(keyHex, sizeof(keyHex), "%016llx",
+                  static_cast<unsigned long long>(cacheKey));
+    const std::filesystem::path cachePath =
+        m_cacheDir / (baseName + "." + keyHex + ".spv");
+    if (std::ifstream cached{cachePath, std::ios::binary | std::ios::ate}) {
+        const std::streamsize size = cached.tellg();
+        if (size > 0 && size % 4 == 0) {
+            std::vector<uint32_t> words(static_cast<size_t>(size) / 4);
+            cached.seekg(0);
+            cached.read(reinterpret_cast<char*>(words.data()), size);
+            return words;
+        }
+    }
 
     // std::system goes through cmd.exe; the outer quotes make cmd preserve the
     // quoting of the individual paths.
@@ -75,6 +133,11 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
     std::vector<uint32_t> words(static_cast<size_t>(size) / 4);
     spv.seekg(0);
     spv.read(reinterpret_cast<char*>(words.data()), size);
+
+    if (std::ofstream out{cachePath, std::ios::binary}) {
+        out.write(reinterpret_cast<const char*>(words.data()),
+                  static_cast<std::streamsize>(words.size() * 4));
+    }
     return words;
 }
 

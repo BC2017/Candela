@@ -19,7 +19,18 @@ function(candela_apply_warnings target)
   endif()
 endfunction()
 
-find_package(Vulkan REQUIRED)
+# Only the headers are needed at build time (VK_NO_PROTOTYPES + volk loads
+# the driver at runtime), so building works without an installed SDK — CI
+# runners and fresh clones fall back to fetched headers.
+find_package(Vulkan QUIET)
+if(NOT TARGET Vulkan::Headers)
+  include(FetchContent)
+  FetchContent_Declare(
+    vulkan-headers
+    URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.4.328.1.zip
+  )
+  FetchContent_MakeAvailable(vulkan-headers)
+endif()
 
 include(cmake/Dependencies.cmake)
 

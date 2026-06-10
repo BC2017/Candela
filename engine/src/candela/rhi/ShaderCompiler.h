@@ -28,6 +28,7 @@ public:
 private:
     std::filesystem::path m_slangc;
     std::filesystem::path m_outputDir;
+    std::filesystem::path m_cacheDir; // persistent SPIR-V cache
 };
 
 VkShaderModule createShaderModule(VkDevice device,

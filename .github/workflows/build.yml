@@ -1,0 +1,18 @@
+# Build-only CI: catches compile errors, /W4 /WX warnings, and
+# missing-from-git files (the latter bit us once already).
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  windows-msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: Configure
+        run: cmake -S . -B build/ci -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build/ci

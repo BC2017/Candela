@@ -179,6 +179,8 @@ IBL placeholderIBL(Context& context) {
     IBL ibl;
     const VkImageUsageFlags usage =
         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ibl.environment =
+        createCubeImage(context, VK_FORMAT_R16G16B16A16_SFLOAT, 1, usage);
     ibl.irradiance =
         createCubeImage(context, VK_FORMAT_R16G16B16A16_SFLOAT, 1, usage);
     ibl.prefiltered =
@@ -187,8 +189,8 @@ IBL placeholderIBL(Context& context) {
         createImage2D(context, VK_FORMAT_R16G16_SFLOAT, {1, 1}, usage);
 
     context.immediateSubmit([&](VkCommandBuffer cmd) {
-        for (GpuImage* image :
-             {&ibl.irradiance, &ibl.prefiltered, &ibl.brdfLut}) {
+        for (GpuImage* image : {&ibl.environment, &ibl.irradiance,
+                                &ibl.prefiltered, &ibl.brdfLut}) {
             wholeImageBarrier(cmd, image->image, VK_IMAGE_LAYOUT_UNDEFINED,
                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,

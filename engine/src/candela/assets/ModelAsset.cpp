@@ -217,6 +217,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | rtUsage);
             gpu.indexCount = static_cast<uint32_t>(indices.size());
             gpu.vertexCount = static_cast<uint32_t>(vertices.size());
+            gpu.boundsMin = primMin;
+            gpu.boundsMax = primMax;
             gpu.albedoTexture = whiteIndex;
             gpu.normalTexture = whiteIndex;
             gpu.metallicRoughnessTexture = whiteIndex;
@@ -251,6 +253,18 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                     gpu.occlusionTexture = textureFor(
                         material.occlusionTexture->textureIndex, false);
                 }
+                gpu.emissiveFactor = {material.emissiveFactor[0],
+                                      material.emissiveFactor[1],
+                                      material.emissiveFactor[2]};
+                if (material.emissiveTexture) {
+                    gpu.emissiveTexture = textureFor(
+                        material.emissiveTexture->textureIndex, true);
+                    // glTF defaults emissiveFactor to zero; a texture with a
+                    // zero factor would never show.
+                    if (gpu.emissiveFactor == glm::vec3{0.0f}) {
+                        gpu.emissiveFactor = glm::vec3{1.0f};
+                    }
+                }
                 if (material.alphaMode == fastgltf::AlphaMode::Mask) {
                     gpu.flags |= DrawFlags::kAlphaMask;
                 }
@@ -262,6 +276,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
 
     // --- Bottom-level acceleration structures (one per mesh) ---
     if (context.rayTracingSupported()) {
+        VkDeviceSize blasBuiltBytes = 0;
+        VkDeviceSize blasCompactedBytes = 0;
         for (GpuMesh& mesh : model.meshes) {
             if (mesh.primitives.empty()) {
                 continue;
@@ -274,7 +290,11 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 geometry.sType =
                     VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
                 geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-                geometry.flags = VK_GEOMETRY_OPAQUE_BIT_KHR;
+                // Alpha-masked geometry stays non-opaque so shadow rays can
+                // inspect the albedo alpha at the candidate hit.
+                geometry.flags = (primitive.flags & DrawFlags::kAlphaMask)
+                                     ? 0
+                                     : VK_GEOMETRY_OPAQUE_BIT_KHR;
                 auto& triangles = geometry.geometry.triangles;
                 triangles.sType =
                     VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
@@ -300,7 +320,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
             buildInfo.type =
                 VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
             buildInfo.flags =
-                VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+                VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
             buildInfo.mode =
                 VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             buildInfo.geometryCount =
@@ -347,12 +368,73 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
             });
             destroyBuffer(context, scratch);
 
+            // --- Compaction: copy into a right-sized structure (~half the
+            // memory on typical meshes) and drop the build-sized one. ---
+            VkQueryPoolCreateInfo queryInfo{};
+            queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            queryInfo.queryType =
+                VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+            queryInfo.queryCount = 1;
+            VkQueryPool query = VK_NULL_HANDLE;
+            VK_CHECK(vkCreateQueryPool(context.device(), &queryInfo, nullptr,
+                                       &query));
+            context.immediateSubmit([&](VkCommandBuffer cmd) {
+                vkCmdResetQueryPool(cmd, query, 0, 1);
+                vkCmdWriteAccelerationStructuresPropertiesKHR(
+                    cmd, 1, &mesh.blas,
+                    VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                    query, 0);
+            });
+            VkDeviceSize compactedSize = 0;
+            VK_CHECK(vkGetQueryPoolResults(
+                context.device(), query, 0, 1, sizeof(compactedSize),
+                &compactedSize, sizeof(compactedSize),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+            vkDestroyQueryPool(context.device(), query, nullptr);
+
+            GpuBuffer compactBuffer = createBuffer(
+                context, compactedSize,
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            VkAccelerationStructureCreateInfoKHR compactInfo{};
+            compactInfo.sType =
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+            compactInfo.buffer = compactBuffer.buffer;
+            compactInfo.size = compactedSize;
+            compactInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            VkAccelerationStructureKHR compactBlas = VK_NULL_HANDLE;
+            VK_CHECK(vkCreateAccelerationStructureKHR(
+                context.device(), &compactInfo, nullptr, &compactBlas));
+            context.immediateSubmit([&](VkCommandBuffer cmd) {
+                VkCopyAccelerationStructureInfoKHR copy{};
+                copy.sType =
+                    VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+                copy.src = mesh.blas;
+                copy.dst = compactBlas;
+                copy.mode =
+                    VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+                vkCmdCopyAccelerationStructureKHR(cmd, &copy);
+            });
+            vkDestroyAccelerationStructureKHR(context.device(), mesh.blas,
+                                              nullptr);
+            destroyBuffer(context, mesh.blasBuffer);
+            mesh.blas = compactBlas;
+            mesh.blasBuffer = compactBuffer;
+            blasBuiltBytes += sizes.accelerationStructureSize;
+            blasCompactedBytes += compactedSize;
+
             VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
             addressInfo.sType =
                 VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
             addressInfo.accelerationStructure = mesh.blas;
             mesh.blasAddress = vkGetAccelerationStructureDeviceAddressKHR(
                 context.device(), &addressInfo);
+        }
+        if (blasBuiltBytes > 0) {
+            CD_INFO("BLAS compaction: {:.2f} MB -> {:.2f} MB",
+                    static_cast<double>(blasBuiltBytes) / (1024.0 * 1024.0),
+                    static_cast<double>(blasCompactedBytes) /
+                        (1024.0 * 1024.0));
         }
     }
 

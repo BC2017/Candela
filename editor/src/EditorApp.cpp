@@ -911,7 +911,8 @@ void EditorApp::drawStats(World& world, float dt) {
     ImGui::SeparatorText("Scene");
     ImGui::Text("Entities: %zu   Lights: %u",
                 world.registry.storage<Name>().size(), stats.pointLights);
-    ImGui::Text("Draws: %u   Triangles: %.2f M", stats.drawCalls,
+    ImGui::Text("Draws: %u (%u culled)   Triangles: %.2f M", stats.drawCalls,
+                stats.culledDraws,
                 static_cast<double>(stats.triangles) / 1e6);
     ImGui::Text("Viewport: %u x %u", stats.sceneExtent.width,
                 stats.sceneExtent.height);

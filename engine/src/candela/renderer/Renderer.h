@@ -41,6 +41,7 @@ struct GpuPassTiming {
 
 struct RenderStats {
     uint32_t drawCalls = 0; // scene draws per geometry pass
+    uint32_t culledDraws = 0;
     uint32_t triangles = 0;
     uint32_t pointLights = 0;
     uint32_t rtInstances = 0;
@@ -130,6 +131,13 @@ private:
         // GPU pass timings (2 timestamps per pass).
         VkQueryPool queryPool = VK_NULL_HANDLE;
         std::vector<std::string> timestampNames;
+        // Screenshot readback (per slot, so sequences can capture every
+        // frame — flythrough recording).
+        GpuBuffer screenshotBuffer;
+        void* screenshotMapped = nullptr;
+        std::filesystem::path screenshotPath;
+        VkExtent2D screenshotExtent{};
+        bool screenshotPending = false;
     };
     static constexpr uint32_t kMaxTimestampQueries = 64;
 
@@ -158,6 +166,9 @@ private:
         glm::mat4 transform;
         const GpuPrimitive* primitive;
         uint32_t entityId; // entt id + 1
+        // Inside the camera frustum (G-buffer pass). Shadow passes always
+        // draw — casters behind the camera still shadow what's visible.
+        bool visible = true;
     };
 
     struct FrameLight {
@@ -215,6 +226,8 @@ private:
     FrameData m_frames[kFramesInFlight];
     std::vector<VkSemaphore> m_presentSemaphores;
 
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE; // persisted to disk
+    std::filesystem::path m_pipelineCachePath;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_gbufferPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
@@ -254,6 +267,7 @@ private:
     uint32_t m_irradianceSlot = 0;
     uint32_t m_prefilteredSlot = 0;
     uint32_t m_brdfLutSlot = 0;
+    uint32_t m_environmentSlot = 0;
 
     std::unordered_map<VkImageView, uint32_t> m_viewSlots;
 
@@ -273,13 +287,8 @@ private:
     bool m_pickPending = false;
     std::optional<uint32_t> m_pickResult;
 
-    // One in-flight screenshot readback.
-    GpuBuffer m_screenshotBuffer;
-    void* m_screenshotMapped = nullptr;
-    std::filesystem::path m_screenshotPath; // empty = none requested
-    VkExtent2D m_screenshotExtent{};
-    uint32_t m_screenshotFrameSlot = UINT32_MAX;
-    bool m_screenshotPending = false;
+    // Pending screenshot request, consumed by the next recorded frame.
+    std::filesystem::path m_screenshotRequest;
 
     TracyVkCtx m_tracyCtx = nullptr;
 

@@ -79,8 +79,11 @@ static const uint kRTReflections = 1u << 2;
 
 // --- Ray helpers ---
 
-// 1 = unoccluded. Opaque any-hit visibility ray.
-float traceVisibility(RaytracingAccelerationStructure tlas, float3 origin,
+// 1 = unoccluded. Visibility ray; alpha-masked geometry (non-opaque in the
+// BLAS) is resolved by sampling the albedo alpha at the candidate hit, so
+// foliage casts cutout-shaped shadows instead of full-quad ones.
+float traceVisibility(RaytracingAccelerationStructure tlas,
+                      InstanceData* instanceData, float3 origin,
                       float3 direction, float tMax)
 {
     RayDesc ray;
@@ -90,7 +93,24 @@ float traceVisibility(RaytracingAccelerationStructure tlas, float3 origin,
     ray.TMax = tMax;
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
     query.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
-    query.Proceed();
+    while (query.Proceed())
+    {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+            continue;
+        InstanceData data = instanceData[query.CandidateInstanceID() +
+                                         query.CandidateGeometryIndex()];
+        uint triangle = query.CandidatePrimitiveIndex();
+        float2 bary = query.CandidateTriangleBarycentrics();
+        float2 uv0 = data.vertices[data.indices[triangle * 3 + 0]].uv();
+        float2 uv1 = data.vertices[data.indices[triangle * 3 + 1]].uv();
+        float2 uv2 = data.vertices[data.indices[triangle * 3 + 2]].uv();
+        float2 uv = uv0 * (1.0 - bary.x - bary.y) + uv1 * bary.x +
+                    uv2 * bary.y;
+        float alpha = gTextures[data.albedoTexture].SampleLevel(uv, 0.0).a *
+                      data.baseColorFactor.a;
+        if (alpha >= 0.5)
+            query.CommitNonOpaqueTriangleHit();
+    }
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 

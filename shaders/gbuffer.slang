@@ -4,22 +4,24 @@
 //   RT2 (RGBA8_UNORM) metallic, roughness, AO, unused
 //   RT3 (R32_UINT)    entity id (picking)
 //   RT4 (RG16F)       UV-space velocity (jitter-free) for reprojection
+//   RT5 (RGBA8_SRGB)  emission (texture * factor)
 
 #include "common.slang"
 
+// 128-byte budget is full: texture slots ride in 16-bit pairs, factors in
+// packed unorms. Must match the C++ GBufferPush exactly.
 struct GBufferPush
 {
     float4x4 model;          // 64
     Vertex* vertices;        // 72
     FrameConstants* frame;   // 80
-    uint albedoTexture;      // 84
-    uint normalTexture;      // 88
-    uint metallicRoughnessTexture; // 92
-    uint occlusionTexture;   // 96
-    uint flags;              // 100
-    float metallicFactor;    // 104
-    float roughnessFactor;   // 108
-    uint entityId;           // 112 (entt id + 1; 0 = none, for picking)
+    uint albedoNormalTex;    // 84  albedo | normal << 16
+    uint mrOcclusionTex;     // 88  metallicRoughness | occlusion << 16
+    uint emissiveTexFlags;   // 92  emissive | flags << 16
+    uint metallicRoughness;  // 96  16-bit unorm metallic | roughness << 16
+    uint emissiveFactor;     // 100 RGB 8-bit unorm
+    uint entityId;           // 104 (entt id + 1; 0 = none, for picking)
+    uint2 pad;               // 112
     float4 baseColorFactor;  // 128
 };
 
@@ -65,41 +67,58 @@ struct GBufferOut
     float4 material : SV_Target2;
     uint entityId : SV_Target3;
     float2 velocity : SV_Target4;
+    float4 emissive : SV_Target5;
 };
 
 [shader("fragment")]
 GBufferOut fsMain(VSOut input)
 {
-    float4 baseColor = gTextures[gPush.albedoTexture].Sample(input.uv)
+    const uint albedoTexture = gPush.albedoNormalTex & 0xffff;
+    const uint normalTexture = gPush.albedoNormalTex >> 16;
+    const uint mrTexture = gPush.mrOcclusionTex & 0xffff;
+    const uint occlusionTexture = gPush.mrOcclusionTex >> 16;
+    const uint emissiveTexture = gPush.emissiveTexFlags & 0xffff;
+    const uint flags = gPush.emissiveTexFlags >> 16;
+    const float metallicFactor = float(gPush.metallicRoughness & 0xffff) / 65535.0;
+    const float roughnessFactor = float(gPush.metallicRoughness >> 16) / 65535.0;
+    const float3 emissiveFactor =
+        float3(float(gPush.emissiveFactor & 0xff),
+               float((gPush.emissiveFactor >> 8) & 0xff),
+               float((gPush.emissiveFactor >> 16) & 0xff)) / 255.0;
+
+    float4 baseColor = gTextures[albedoTexture].Sample(input.uv)
                        * gPush.baseColorFactor;
-    if ((gPush.flags & kFlagAlphaMask) != 0 && baseColor.a < 0.5)
+    if ((flags & kFlagAlphaMask) != 0 && baseColor.a < 0.5)
         discard;
 
     float3 normal = normalize(input.worldNormal);
-    if ((gPush.flags & kFlagHasNormalMap) != 0)
+    if ((flags & kFlagHasNormalMap) != 0)
     {
         float3 tangent = normalize(input.worldTangent.xyz);
         // Re-orthogonalize after interpolation.
         tangent = normalize(tangent - normal * dot(normal, tangent));
         float3 bitangent = cross(normal, tangent) * input.worldTangent.w;
         float3 sampled =
-            gTextures[gPush.normalTexture].Sample(input.uv).xyz * 2.0 - 1.0;
+            gTextures[normalTexture].Sample(input.uv).xyz * 2.0 - 1.0;
         normal = normalize(sampled.x * tangent + sampled.y * bitangent +
                            sampled.z * normal);
     }
 
     // glTF: metallic in B, roughness in G; occlusion in R (often the same
     // texture).
-    float4 mr = gTextures[gPush.metallicRoughnessTexture].Sample(input.uv);
-    float metallic = saturate(mr.b * gPush.metallicFactor);
-    float roughness = saturate(mr.g * gPush.roughnessFactor);
-    float occlusion = gTextures[gPush.occlusionTexture].Sample(input.uv).r;
+    float4 mr = gTextures[mrTexture].Sample(input.uv);
+    float metallic = saturate(mr.b * metallicFactor);
+    float roughness = saturate(mr.g * roughnessFactor);
+    float occlusion = gTextures[occlusionTexture].Sample(input.uv).r;
 
     GBufferOut output;
     output.albedo = float4(baseColor.rgb, 1.0);
     output.normal = encodeOctahedral(normal);
     output.material = float4(metallic, roughness, occlusion, 0.0);
     output.entityId = gPush.entityId;
+    output.emissive =
+        float4(gTextures[emissiveTexture].Sample(input.uv).rgb * emissiveFactor,
+               1.0);
     // UV-space motion: prevUV = uv - velocity.
     float2 currUV = ndcToUV(input.clipNoJitter.xy / input.clipNoJitter.w);
     float2 prevUV =

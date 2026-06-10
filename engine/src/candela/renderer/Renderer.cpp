@@ -6,11 +6,14 @@
 #include "candela/renderer/Cascades.h"
 #include "candela/scene/World.h"
 
+#include <glm/gtc/matrix_access.hpp>
 #include <stb_image_write.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 namespace candela {
@@ -71,21 +74,45 @@ constexpr VkShaderStageFlags kPushStages = VK_SHADER_STAGE_VERTEX_BIT |
                                            VK_SHADER_STAGE_FRAGMENT_BIT |
                                            VK_SHADER_STAGE_COMPUTE_BIT;
 
+// The 128-byte push budget is full, so texture slots ride in 16-bit pairs
+// (bindless tables top out at 16384 slots) and factors are packed unorms.
+// Must match gbuffer.slang exactly — including the pad before the
+// 16-aligned float4.
 struct GBufferPush {
     glm::mat4 model;
     VkDeviceAddress vertices;
     VkDeviceAddress frame;
-    uint32_t albedoTexture;
-    uint32_t normalTexture;
-    uint32_t metallicRoughnessTexture;
-    uint32_t occlusionTexture;
-    uint32_t flags;
-    float metallicFactor;
-    float roughnessFactor;
-    uint32_t entityId; // entt id + 1; 0 = no entity (picking)
+    uint32_t albedoNormalTex;       // albedo | normal << 16
+    uint32_t mrOcclusionTex;        // metallicRoughness | occlusion << 16
+    uint32_t emissiveTexFlags;      // emissive | flags << 16
+    uint32_t metallicRoughness;     // 16-bit unorm metallic | roughness << 16
+    uint32_t emissiveFactorPacked;  // RGB 8-bit unorm
+    uint32_t entityId;              // entt id + 1; 0 = no entity (picking)
+    uint32_t pad[2];                // float4 below aligns to 16 in slang
     glm::vec4 baseColorFactor;
 };
+static_assert(offsetof(GBufferPush, baseColorFactor) == 112,
+              "GBufferPush must match gbuffer.slang");
 static_assert(sizeof(GBufferPush) == 128, "GBufferPush must fit push budget");
+
+uint32_t packU16x2(uint32_t low, uint32_t high) {
+    return (low & 0xffffu) | (high << 16);
+}
+
+uint32_t packUnorm16x2(float low, float high) {
+    const auto a =
+        static_cast<uint32_t>(glm::clamp(low, 0.0f, 1.0f) * 65535.0f);
+    const auto b =
+        static_cast<uint32_t>(glm::clamp(high, 0.0f, 1.0f) * 65535.0f);
+    return a | (b << 16);
+}
+
+uint32_t packUnorm8x3(const glm::vec3& v) {
+    const auto r = static_cast<uint32_t>(glm::clamp(v.r, 0.0f, 1.0f) * 255.0f);
+    const auto g = static_cast<uint32_t>(glm::clamp(v.g, 0.0f, 1.0f) * 255.0f);
+    const auto b = static_cast<uint32_t>(glm::clamp(v.b, 0.0f, 1.0f) * 255.0f);
+    return r | (g << 8) | (b << 16);
+}
 
 struct ShadowPush {
     glm::mat4 lightViewProjModel;
@@ -108,7 +135,47 @@ struct LightingPush {
     uint32_t debugView;
     uint32_t reflectionTexture; // accumulated RT reflections (bit 2)
     uint32_t aoTexture;         // accumulated RT AO (bit 1)
+    uint32_t environmentCube;   // sky background
+    uint32_t gbEmissive;
 };
+
+// Gribb–Hartmann frustum planes from a view-projection matrix (Vulkan
+// z∈[0,w]; works for the reverse-Z infinite projection unchanged).
+struct Frustum {
+    glm::vec4 planes[6];
+};
+
+Frustum frustumFromMatrix(const glm::mat4& m) {
+    const glm::vec4 r0 = glm::row(m, 0);
+    const glm::vec4 r1 = glm::row(m, 1);
+    const glm::vec4 r2 = glm::row(m, 2);
+    const glm::vec4 r3 = glm::row(m, 3);
+    return {{r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2}};
+}
+
+bool aabbVisible(const Frustum& frustum, const glm::vec3& boundsMin,
+                 const glm::vec3& boundsMax, const glm::mat4& transform) {
+    glm::vec4 corners[8];
+    for (int i = 0; i < 8; ++i) {
+        corners[i] = transform * glm::vec4((i & 1) ? boundsMax.x : boundsMin.x,
+                                           (i & 2) ? boundsMax.y : boundsMin.y,
+                                           (i & 4) ? boundsMax.z : boundsMin.z,
+                                           1.0f);
+    }
+    for (const glm::vec4& plane : frustum.planes) {
+        bool anyInside = false;
+        for (const glm::vec4& corner : corners) {
+            if (glm::dot(plane, corner) >= 0.0f) {
+                anyInside = true;
+                break;
+            }
+        }
+        if (!anyInside) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct AOPush {
     VkDeviceAddress frame;
@@ -250,6 +317,8 @@ Renderer::Renderer(Window& window) : m_window(window) {
     m_brdfLutSlot = m_bindless->add(Bindless::Kind::Texture2D,
                                     m_ibl.brdfLut.view,
                                     m_bindless->clampSampler());
+    m_environmentSlot = m_bindless->add(
+        Bindless::Kind::Cube, m_ibl.environment.view, m_bindless->clampSampler());
 
     m_rtSupported = m_context->rayTracingSupported();
     if (m_rtSupported) {
@@ -264,6 +333,30 @@ Renderer::Renderer(Window& window) : m_window(window) {
         m_shaderTimestamp =
             (std::max)(m_shaderTimestamp, entry.last_write_time(ec));
     }
+
+    // Driver pipeline cache, persisted across runs (the driver validates the
+    // header and ignores stale/foreign data).
+    if (const char* localAppData = std::getenv("LOCALAPPDATA")) {
+        m_pipelineCachePath = std::filesystem::path(localAppData) /
+                              "Candela" / "pipeline.cache";
+    } else {
+        m_pipelineCachePath = std::filesystem::temp_directory_path() /
+                              "candela-pipeline.cache";
+    }
+    std::vector<char> cacheData;
+    if (std::ifstream in{m_pipelineCachePath,
+                         std::ios::binary | std::ios::ate}) {
+        cacheData.resize(static_cast<size_t>(in.tellg()));
+        in.seekg(0);
+        in.read(cacheData.data(),
+                static_cast<std::streamsize>(cacheData.size()));
+    }
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cacheInfo.initialDataSize = cacheData.size();
+    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+    VK_CHECK(vkCreatePipelineCache(m_context->device(), &cacheInfo, nullptr,
+                                   &m_pipelineCache));
 
     CD_ASSERT(createPipelines(), "Initial shader compilation failed");
     m_lastReloadCheck = std::chrono::steady_clock::now();
@@ -443,7 +536,6 @@ Renderer::~Renderer() {
     m_context->waitIdle();
 
     destroyBuffer(*m_context, m_pickBuffer);
-    destroyBuffer(*m_context, m_screenshotBuffer);
     destroyImage(*m_context, m_viewportImage);
     destroyTemporalTarget(m_aoTemporal);
     destroyTemporalTarget(m_reflectionsTemporal);
@@ -474,6 +566,22 @@ Renderer::~Renderer() {
     }
     if (m_pipelineLayout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
+    }
+    if (m_pipelineCache != VK_NULL_HANDLE) {
+        size_t dataSize = 0;
+        vkGetPipelineCacheData(device, m_pipelineCache, &dataSize, nullptr);
+        std::vector<char> data(dataSize);
+        if (dataSize > 0 &&
+            vkGetPipelineCacheData(device, m_pipelineCache, &dataSize,
+                                   data.data()) == VK_SUCCESS) {
+            std::filesystem::create_directories(
+                m_pipelineCachePath.parent_path());
+            if (std::ofstream out{m_pipelineCachePath, std::ios::binary}) {
+                out.write(data.data(),
+                          static_cast<std::streamsize>(dataSize));
+            }
+        }
+        vkDestroyPipelineCache(device, m_pipelineCache, nullptr);
     }
     destroyPresentSemaphores();
     destroyFrameData();
@@ -540,6 +648,7 @@ void Renderer::destroyFrameData() {
             destroyBuffer(*m_context, frame.instanceData);
         }
         destroyBuffer(*m_context, frame.constants);
+        destroyBuffer(*m_context, frame.screenshotBuffer);
         vkDestroyQueryPool(device, frame.queryPool, nullptr);
         vkDestroyFence(device, frame.inFlightFence, nullptr);
         vkDestroySemaphore(device, frame.acquireSemaphore, nullptr);
@@ -688,7 +797,7 @@ VkPipeline Renderer::buildPipeline(const PipelineDesc& desc) {
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateGraphicsPipelines(
-        m_context->device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+        m_context->device(), m_pipelineCache, 1, &pipelineInfo, nullptr,
         &pipeline);
     if (result != VK_SUCCESS) {
         CD_ERROR("vkCreateGraphicsPipelines failed for {}: {}",
@@ -714,7 +823,7 @@ VkPipeline Renderer::buildComputePipeline(const std::string& shaderFile,
     info.layout = m_pipelineLayout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateComputePipelines(
-        m_context->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+        m_context->device(), m_pipelineCache, 1, &info, nullptr, &pipeline);
     if (result != VK_SUCCESS) {
         CD_ERROR("vkCreateComputePipelines failed for {}: {}", shaderFile,
                  string_VkResult(result));
@@ -729,9 +838,9 @@ bool Renderer::createPipelines() {
     PipelineDesc gbuffer;
     gbuffer.shaderFile = "gbuffer.slang";
     gbuffer.fsEntry = "fsMain";
-    gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16_UNORM,
+    gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB,  VK_FORMAT_R16G16_UNORM,
                             VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT,
-                            VK_FORMAT_R16G16_SFLOAT};
+                            VK_FORMAT_R16G16_SFLOAT,  VK_FORMAT_R8G8B8A8_SRGB};
     gbuffer.depthFormat = kDepthFormat;
     gbuffer.depthTest = true;
     gbuffer.depthWrite = true;
@@ -861,11 +970,7 @@ std::optional<uint32_t> Renderer::takePickResult() {
 }
 
 void Renderer::requestScreenshot(std::filesystem::path path) {
-    if (m_screenshotPending) {
-        CD_WARN("Screenshot already in flight, ignoring request");
-        return;
-    }
-    m_screenshotPath = std::move(path);
+    m_screenshotRequest = std::move(path);
 }
 
 void Renderer::recreateSwapchain() {
@@ -1090,6 +1195,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     const RenderGraph::Handle gbVelocity = graph.createImage(
         "gb-velocity", VK_FORMAT_R16G16_SFLOAT, extent,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    const RenderGraph::Handle gbEmissive = graph.createImage(
+        "gb-emissive", VK_FORMAT_R8G8B8A8_SRGB, extent,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     const RenderGraph::Handle depth = graph.createImage(
         "depth", kDepthFormat, extent,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -1202,6 +1310,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             {gbMaterial, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbEntityId, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbVelocity, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
+            {gbEmissive, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
         };
         RenderGraph::Attachment depthAttachment;
         depthAttachment.handle = depth;
@@ -1215,19 +1324,25 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
             for (const FrameDraw& draw : m_frameDraws) {
+                if (!draw.visible) {
+                    continue; // frustum-culled
+                }
                 const GpuPrimitive& primitive = *draw.primitive;
                 GBufferPush push{};
                 push.model = draw.transform;
                 push.vertices = primitive.vertexBuffer.deviceAddress;
                 push.frame = frameAddress;
-                push.albedoTexture = primitive.albedoTexture;
-                push.normalTexture = primitive.normalTexture;
-                push.metallicRoughnessTexture =
-                    primitive.metallicRoughnessTexture;
-                push.occlusionTexture = primitive.occlusionTexture;
-                push.flags = primitive.flags;
-                push.metallicFactor = primitive.metallicFactor;
-                push.roughnessFactor = primitive.roughnessFactor;
+                push.albedoNormalTex = packU16x2(primitive.albedoTexture,
+                                                 primitive.normalTexture);
+                push.mrOcclusionTex =
+                    packU16x2(primitive.metallicRoughnessTexture,
+                              primitive.occlusionTexture);
+                push.emissiveTexFlags =
+                    packU16x2(primitive.emissiveTexture, primitive.flags);
+                push.metallicRoughness = packUnorm16x2(
+                    primitive.metallicFactor, primitive.roughnessFactor);
+                push.emissiveFactorPacked =
+                    packUnorm8x3(primitive.emissiveFactor);
                 push.entityId = draw.entityId;
                 push.baseColorFactor = primitive.baseColorFactor;
                 vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
@@ -1339,7 +1454,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         pass.name = "lighting";
         pass.colorAttachments = {
             {hdr, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}}};
-        pass.sampledImages = {gbAlbedo, gbNormal, gbMaterial, depth, shadowMap};
+        pass.sampledImages = {gbAlbedo, gbNormal,  gbMaterial,
+                              depth,    shadowMap, gbEmissive};
         if (reflectionsActive) {
             pass.sampledImages.push_back(reflectionsAccumulated);
         }
@@ -1356,6 +1472,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.irradianceCube = m_irradianceSlot;
         push.prefilteredCube = m_prefilteredSlot;
         push.brdfLut = m_brdfLutSlot;
+        push.environmentCube = m_environmentSlot;
+        push.gbEmissive = slotFor(graph.view(gbEmissive));
         push.invResolution = {1.0f / static_cast<float>(extent.width),
                               1.0f / static_cast<float>(extent.height)};
         push.iblIntensity = world.settings.iblIntensity;
@@ -1534,20 +1652,22 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     frame.timestampNames = std::move(timestamps.names);
 
     // --- Screenshot readback: whole backbuffer after all passes ---
-    if (!m_screenshotPath.empty() && !m_screenshotPending) {
+    FrameData& screenshotFrame = m_frames[m_frameIndex];
+    if (!m_screenshotRequest.empty()) {
         const VkDeviceSize byteSize =
             VkDeviceSize(swapExtent.width) * swapExtent.height * 4;
-        if (m_screenshotBuffer.buffer == VK_NULL_HANDLE ||
-            m_screenshotBuffer.size < byteSize) {
-            destroyBuffer(*m_context, m_screenshotBuffer);
-            m_screenshotBuffer = createBuffer(
+        if (screenshotFrame.screenshotBuffer.buffer == VK_NULL_HANDLE ||
+            screenshotFrame.screenshotBuffer.size < byteSize) {
+            destroyBuffer(*m_context, screenshotFrame.screenshotBuffer);
+            screenshotFrame.screenshotBuffer = createBuffer(
                 *m_context, byteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
             VmaAllocationInfo info{};
             vmaGetAllocationInfo(m_context->allocator(),
-                                 m_screenshotBuffer.allocation, &info);
-            m_screenshotMapped = info.pMappedData;
+                                 screenshotFrame.screenshotBuffer.allocation,
+                                 &info);
+            screenshotFrame.screenshotMapped = info.pMappedData;
         }
 
         VkImageMemoryBarrier2 barrier{};
@@ -1576,7 +1696,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         region.imageExtent = {swapExtent.width, swapExtent.height, 1};
         vkCmdCopyImageToBuffer(cmd, m_swapchain->image(imageIndex),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               m_screenshotBuffer.buffer, 1, &region);
+                               screenshotFrame.screenshotBuffer.buffer, 1,
+                               &region);
 
         std::swap(barrier.srcStageMask, barrier.dstStageMask);
         barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -1585,9 +1706,10 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         vkCmdPipelineBarrier2(cmd, &dependency);
 
-        m_screenshotExtent = swapExtent;
-        m_screenshotFrameSlot = m_frameIndex;
-        m_screenshotPending = true;
+        screenshotFrame.screenshotExtent = swapExtent;
+        screenshotFrame.screenshotPath = std::move(m_screenshotRequest);
+        screenshotFrame.screenshotPending = true;
+        m_screenshotRequest.clear();
     }
 
     // --- Pick readback: one texel of the entity-ID target ---
@@ -1678,17 +1800,27 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     m_frameDraws.clear();
     m_frameLights.clear();
     uint32_t triangles = 0;
+    uint32_t culled = 0;
+    const float cullAspect = static_cast<float>(sceneExtent.width) /
+                             static_cast<float>((std::max)(1u, sceneExtent.height));
+    const Frustum frustum =
+        frustumFromMatrix(camera.viewProjection(cullAspect));
     for (auto [entity, transform, mesh] :
          world.registry.view<WorldTransform, MeshRenderer>().each()) {
         const ModelAsset* model = assets.tryGetModel(mesh.model);
         if (model == nullptr || mesh.meshIndex >= model->meshes.size()) {
             continue;
         }
+        const GpuMesh& gpuMesh = model->meshes[mesh.meshIndex];
         const uint32_t entityId = static_cast<uint32_t>(entity) + 1;
-        for (const GpuPrimitive& primitive :
-             model->meshes[mesh.meshIndex].primitives) {
-            m_frameDraws.push_back({transform.value, &primitive, entityId});
-            triangles += primitive.indexCount / 3;
+        for (const GpuPrimitive& primitive : gpuMesh.primitives) {
+            const bool visible =
+                aabbVisible(frustum, primitive.boundsMin, primitive.boundsMax,
+                            transform.value);
+            m_frameDraws.push_back(
+                {transform.value, &primitive, entityId, visible});
+            triangles += visible ? primitive.indexCount / 3 : 0;
+            culled += visible ? 0u : 1u;
         }
     }
     for (auto [entity, transform, light] :
@@ -1697,7 +1829,8 @@ void Renderer::drawFrame(const Camera& camera, World& world,
                                  light.color, light.intensity});
     }
 
-    m_stats.drawCalls = static_cast<uint32_t>(m_frameDraws.size());
+    m_stats.drawCalls = static_cast<uint32_t>(m_frameDraws.size()) - culled;
+    m_stats.culledDraws = culled;
     m_stats.triangles = triangles;
     m_stats.pointLights = static_cast<uint32_t>(m_frameLights.size());
     m_stats.rayTracingSupported = m_rtSupported;
@@ -1721,6 +1854,9 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         m_brdfLutSlot = m_bindless->add(Bindless::Kind::Texture2D,
                                         m_ibl.brdfLut.view,
                                         m_bindless->clampSampler());
+        m_environmentSlot = m_bindless->add(Bindless::Kind::Cube,
+                                            m_ibl.environment.view,
+                                            m_bindless->clampSampler());
         m_iblReady = true;
     }
 
@@ -1765,23 +1901,24 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     }
 
     // Likewise the screenshot copy — swizzle BGRA→RGBA and write the PNG.
-    if (m_screenshotPending && m_screenshotFrameSlot == m_frameIndex) {
-        const uint32_t width = m_screenshotExtent.width;
-        const uint32_t height = m_screenshotExtent.height;
+    if (frame.screenshotPending) {
+        const uint32_t width = frame.screenshotExtent.width;
+        const uint32_t height = frame.screenshotExtent.height;
         std::vector<uint8_t> rgba(size_t(width) * height * 4);
-        const auto* src = static_cast<const uint8_t*>(m_screenshotMapped);
+        const auto* src =
+            static_cast<const uint8_t*>(frame.screenshotMapped);
         for (size_t i = 0; i < rgba.size(); i += 4) {
             rgba[i + 0] = src[i + 2];
             rgba[i + 1] = src[i + 1];
             rgba[i + 2] = src[i + 0];
             rgba[i + 3] = 255;
         }
-        stbi_write_png(m_screenshotPath.string().c_str(),
+        stbi_write_png(frame.screenshotPath.string().c_str(),
                        static_cast<int>(width), static_cast<int>(height), 4,
                        rgba.data(), static_cast<int>(width) * 4);
-        CD_INFO("Screenshot written: {}", m_screenshotPath.string());
-        m_screenshotPath.clear();
-        m_screenshotPending = false;
+        CD_INFO("Screenshot written: {}", frame.screenshotPath.string());
+        frame.screenshotPath.clear();
+        frame.screenshotPending = false;
     }
 
     uint32_t imageIndex = 0;
