@@ -253,6 +253,18 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                     gpu.occlusionTexture = textureFor(
                         material.occlusionTexture->textureIndex, false);
                 }
+                gpu.emissiveFactor = {material.emissiveFactor[0],
+                                      material.emissiveFactor[1],
+                                      material.emissiveFactor[2]};
+                if (material.emissiveTexture) {
+                    gpu.emissiveTexture = textureFor(
+                        material.emissiveTexture->textureIndex, true);
+                    // glTF defaults emissiveFactor to zero; a texture with a
+                    // zero factor would never show.
+                    if (gpu.emissiveFactor == glm::vec3{0.0f}) {
+                        gpu.emissiveFactor = glm::vec3{1.0f};
+                    }
+                }
                 if (material.alphaMode == fastgltf::AlphaMode::Mask) {
                     gpu.flags |= DrawFlags::kAlphaMask;
                 }

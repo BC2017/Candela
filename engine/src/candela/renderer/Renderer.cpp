@@ -11,7 +11,9 @@
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <vector>
 
 namespace candela {
@@ -72,21 +74,45 @@ constexpr VkShaderStageFlags kPushStages = VK_SHADER_STAGE_VERTEX_BIT |
                                            VK_SHADER_STAGE_FRAGMENT_BIT |
                                            VK_SHADER_STAGE_COMPUTE_BIT;
 
+// The 128-byte push budget is full, so texture slots ride in 16-bit pairs
+// (bindless tables top out at 16384 slots) and factors are packed unorms.
+// Must match gbuffer.slang exactly — including the pad before the
+// 16-aligned float4.
 struct GBufferPush {
     glm::mat4 model;
     VkDeviceAddress vertices;
     VkDeviceAddress frame;
-    uint32_t albedoTexture;
-    uint32_t normalTexture;
-    uint32_t metallicRoughnessTexture;
-    uint32_t occlusionTexture;
-    uint32_t flags;
-    float metallicFactor;
-    float roughnessFactor;
-    uint32_t entityId; // entt id + 1; 0 = no entity (picking)
+    uint32_t albedoNormalTex;       // albedo | normal << 16
+    uint32_t mrOcclusionTex;        // metallicRoughness | occlusion << 16
+    uint32_t emissiveTexFlags;      // emissive | flags << 16
+    uint32_t metallicRoughness;     // 16-bit unorm metallic | roughness << 16
+    uint32_t emissiveFactorPacked;  // RGB 8-bit unorm
+    uint32_t entityId;              // entt id + 1; 0 = no entity (picking)
+    uint32_t pad[2];                // float4 below aligns to 16 in slang
     glm::vec4 baseColorFactor;
 };
+static_assert(offsetof(GBufferPush, baseColorFactor) == 112,
+              "GBufferPush must match gbuffer.slang");
 static_assert(sizeof(GBufferPush) == 128, "GBufferPush must fit push budget");
+
+uint32_t packU16x2(uint32_t low, uint32_t high) {
+    return (low & 0xffffu) | (high << 16);
+}
+
+uint32_t packUnorm16x2(float low, float high) {
+    const auto a =
+        static_cast<uint32_t>(glm::clamp(low, 0.0f, 1.0f) * 65535.0f);
+    const auto b =
+        static_cast<uint32_t>(glm::clamp(high, 0.0f, 1.0f) * 65535.0f);
+    return a | (b << 16);
+}
+
+uint32_t packUnorm8x3(const glm::vec3& v) {
+    const auto r = static_cast<uint32_t>(glm::clamp(v.r, 0.0f, 1.0f) * 255.0f);
+    const auto g = static_cast<uint32_t>(glm::clamp(v.g, 0.0f, 1.0f) * 255.0f);
+    const auto b = static_cast<uint32_t>(glm::clamp(v.b, 0.0f, 1.0f) * 255.0f);
+    return r | (g << 8) | (b << 16);
+}
 
 struct ShadowPush {
     glm::mat4 lightViewProjModel;
@@ -110,6 +136,7 @@ struct LightingPush {
     uint32_t reflectionTexture; // accumulated RT reflections (bit 2)
     uint32_t aoTexture;         // accumulated RT AO (bit 1)
     uint32_t environmentCube;   // sky background
+    uint32_t gbEmissive;
 };
 
 // Gribb–Hartmann frustum planes from a view-projection matrix (Vulkan
@@ -306,6 +333,30 @@ Renderer::Renderer(Window& window) : m_window(window) {
         m_shaderTimestamp =
             (std::max)(m_shaderTimestamp, entry.last_write_time(ec));
     }
+
+    // Driver pipeline cache, persisted across runs (the driver validates the
+    // header and ignores stale/foreign data).
+    if (const char* localAppData = std::getenv("LOCALAPPDATA")) {
+        m_pipelineCachePath = std::filesystem::path(localAppData) /
+                              "Candela" / "pipeline.cache";
+    } else {
+        m_pipelineCachePath = std::filesystem::temp_directory_path() /
+                              "candela-pipeline.cache";
+    }
+    std::vector<char> cacheData;
+    if (std::ifstream in{m_pipelineCachePath,
+                         std::ios::binary | std::ios::ate}) {
+        cacheData.resize(static_cast<size_t>(in.tellg()));
+        in.seekg(0);
+        in.read(cacheData.data(),
+                static_cast<std::streamsize>(cacheData.size()));
+    }
+    VkPipelineCacheCreateInfo cacheInfo{};
+    cacheInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    cacheInfo.initialDataSize = cacheData.size();
+    cacheInfo.pInitialData = cacheData.empty() ? nullptr : cacheData.data();
+    VK_CHECK(vkCreatePipelineCache(m_context->device(), &cacheInfo, nullptr,
+                                   &m_pipelineCache));
 
     CD_ASSERT(createPipelines(), "Initial shader compilation failed");
     m_lastReloadCheck = std::chrono::steady_clock::now();
@@ -516,6 +567,22 @@ Renderer::~Renderer() {
     }
     if (m_pipelineLayout != VK_NULL_HANDLE) {
         vkDestroyPipelineLayout(device, m_pipelineLayout, nullptr);
+    }
+    if (m_pipelineCache != VK_NULL_HANDLE) {
+        size_t dataSize = 0;
+        vkGetPipelineCacheData(device, m_pipelineCache, &dataSize, nullptr);
+        std::vector<char> data(dataSize);
+        if (dataSize > 0 &&
+            vkGetPipelineCacheData(device, m_pipelineCache, &dataSize,
+                                   data.data()) == VK_SUCCESS) {
+            std::filesystem::create_directories(
+                m_pipelineCachePath.parent_path());
+            if (std::ofstream out{m_pipelineCachePath, std::ios::binary}) {
+                out.write(data.data(),
+                          static_cast<std::streamsize>(dataSize));
+            }
+        }
+        vkDestroyPipelineCache(device, m_pipelineCache, nullptr);
     }
     destroyPresentSemaphores();
     destroyFrameData();
@@ -730,7 +797,7 @@ VkPipeline Renderer::buildPipeline(const PipelineDesc& desc) {
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateGraphicsPipelines(
-        m_context->device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+        m_context->device(), m_pipelineCache, 1, &pipelineInfo, nullptr,
         &pipeline);
     if (result != VK_SUCCESS) {
         CD_ERROR("vkCreateGraphicsPipelines failed for {}: {}",
@@ -756,7 +823,7 @@ VkPipeline Renderer::buildComputePipeline(const std::string& shaderFile,
     info.layout = m_pipelineLayout;
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateComputePipelines(
-        m_context->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+        m_context->device(), m_pipelineCache, 1, &info, nullptr, &pipeline);
     if (result != VK_SUCCESS) {
         CD_ERROR("vkCreateComputePipelines failed for {}: {}", shaderFile,
                  string_VkResult(result));
@@ -771,9 +838,9 @@ bool Renderer::createPipelines() {
     PipelineDesc gbuffer;
     gbuffer.shaderFile = "gbuffer.slang";
     gbuffer.fsEntry = "fsMain";
-    gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16_UNORM,
+    gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB,  VK_FORMAT_R16G16_UNORM,
                             VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT,
-                            VK_FORMAT_R16G16_SFLOAT};
+                            VK_FORMAT_R16G16_SFLOAT,  VK_FORMAT_R8G8B8A8_SRGB};
     gbuffer.depthFormat = kDepthFormat;
     gbuffer.depthTest = true;
     gbuffer.depthWrite = true;
@@ -1132,6 +1199,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     const RenderGraph::Handle gbVelocity = graph.createImage(
         "gb-velocity", VK_FORMAT_R16G16_SFLOAT, extent,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    const RenderGraph::Handle gbEmissive = graph.createImage(
+        "gb-emissive", VK_FORMAT_R8G8B8A8_SRGB, extent,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     const RenderGraph::Handle depth = graph.createImage(
         "depth", kDepthFormat, extent,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -1244,6 +1314,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             {gbMaterial, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbEntityId, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbVelocity, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
+            {gbEmissive, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
         };
         RenderGraph::Attachment depthAttachment;
         depthAttachment.handle = depth;
@@ -1265,14 +1336,17 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 push.model = draw.transform;
                 push.vertices = primitive.vertexBuffer.deviceAddress;
                 push.frame = frameAddress;
-                push.albedoTexture = primitive.albedoTexture;
-                push.normalTexture = primitive.normalTexture;
-                push.metallicRoughnessTexture =
-                    primitive.metallicRoughnessTexture;
-                push.occlusionTexture = primitive.occlusionTexture;
-                push.flags = primitive.flags;
-                push.metallicFactor = primitive.metallicFactor;
-                push.roughnessFactor = primitive.roughnessFactor;
+                push.albedoNormalTex = packU16x2(primitive.albedoTexture,
+                                                 primitive.normalTexture);
+                push.mrOcclusionTex =
+                    packU16x2(primitive.metallicRoughnessTexture,
+                              primitive.occlusionTexture);
+                push.emissiveTexFlags =
+                    packU16x2(primitive.emissiveTexture, primitive.flags);
+                push.metallicRoughness = packUnorm16x2(
+                    primitive.metallicFactor, primitive.roughnessFactor);
+                push.emissiveFactorPacked =
+                    packUnorm8x3(primitive.emissiveFactor);
                 push.entityId = draw.entityId;
                 push.baseColorFactor = primitive.baseColorFactor;
                 vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
@@ -1384,7 +1458,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         pass.name = "lighting";
         pass.colorAttachments = {
             {hdr, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}}};
-        pass.sampledImages = {gbAlbedo, gbNormal, gbMaterial, depth, shadowMap};
+        pass.sampledImages = {gbAlbedo, gbNormal,  gbMaterial,
+                              depth,    shadowMap, gbEmissive};
         if (reflectionsActive) {
             pass.sampledImages.push_back(reflectionsAccumulated);
         }
@@ -1402,6 +1477,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.prefilteredCube = m_prefilteredSlot;
         push.brdfLut = m_brdfLutSlot;
         push.environmentCube = m_environmentSlot;
+        push.gbEmissive = slotFor(graph.view(gbEmissive));
         push.invResolution = {1.0f / static_cast<float>(extent.width),
                               1.0f / static_cast<float>(extent.height)};
         push.iblIntensity = world.settings.iblIntensity;

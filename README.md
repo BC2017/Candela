@@ -88,4 +88,6 @@ Run `scripts\get-assets.ps1` once to download the test content: Sponza, FlightHe
 
 Deferred to later phases: emissive + velocity G-buffer targets (TAA/denoising), sky rendering from the environment cube, alpha-tested shadows, IBL disk caching, KTX2/BC texture compression (Phase 3 asset pipeline). Phase 1: render graph, bindless, glTF. Phase 0: Vulkan bring-up, Slang hot reload.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 6 (sky pass, culling, pipeline cache, Bistro demo + flythrough).
+**Phase 6 (core) — image quality & performance.** HDRI sky rendered from the environment cubemap along the view ray; CPU frustum culling against per-primitive AABBs (G-buffer only — shadow casters behind the camera still shadow the view; 25/103 draws culled in the default Sponza view); emissive materials (texture × factor into a sixth G-buffer target, added before bloom — DamagedHelmet's visor finally glows); persistent SPIR-V disk cache + VkPipelineCache (editor cold start 4.2 s → **1.1 s warm**); GitHub Actions build CI that compiles without an installed Vulkan SDK (FetchContent headers fallback). Remaining for Phase 6: Bistro demo scene + captured flythrough, alpha-tested shadow rays, BLAS compaction.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan.

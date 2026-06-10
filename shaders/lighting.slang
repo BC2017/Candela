@@ -21,6 +21,7 @@ struct LightingPush
     uint reflectionTexture; // accumulated RT reflections (kRTReflections)
     uint aoTexture;         // accumulated RT AO (kRTAmbientOcclusion)
     uint environmentCube;   // Cube binding — sky background
+    uint gbEmissive;
 };
 
 [[vk::push_constant]] ConstantBuffer<LightingPush> gPush;
@@ -260,5 +261,7 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
 
     float3 ambient = (diffuseIBL + specularIBL) * occlusion * gPush.iblIntensity;
 
-    return float4(direct + ambient, 1.0);
+    float3 emissive = gTextures[gPush.gbEmissive].Sample(uv).rgb;
+
+    return float4(direct + ambient + emissive, 1.0);
 }

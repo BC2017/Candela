@@ -38,10 +38,13 @@ struct GpuPrimitive {
     uint32_t normalTexture = 0;
     uint32_t metallicRoughnessTexture = 0;
     uint32_t occlusionTexture = 0;
+    uint32_t emissiveTexture = 0;
     uint32_t flags = 0;
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     glm::vec4 baseColorFactor{1.0f};
+    // Zero factor disables emission even with the white fallback texture.
+    glm::vec3 emissiveFactor{0.0f};
     // Object-space bounds (frustum culling at per-primitive granularity —
     // big merged meshes like Sponza would otherwise cull all-or-nothing).
     glm::vec3 boundsMin{0.0f};

@@ -219,6 +219,8 @@ private:
     FrameData m_frames[kFramesInFlight];
     std::vector<VkSemaphore> m_presentSemaphores;
 
+    VkPipelineCache m_pipelineCache = VK_NULL_HANDLE; // persisted to disk
+    std::filesystem::path m_pipelineCachePath;
     VkPipelineLayout m_pipelineLayout = VK_NULL_HANDLE;
     VkPipeline m_gbufferPipeline = VK_NULL_HANDLE;
     VkPipeline m_shadowPipeline = VK_NULL_HANDLE;
