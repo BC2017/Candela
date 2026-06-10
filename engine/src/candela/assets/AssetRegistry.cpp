@@ -1,5 +1,6 @@
 #include "candela/assets/AssetRegistry.h"
 
+#include "candela/assets/BlendImporter.h"
 #include "candela/core/Events.h"
 #include "candela/core/Jobs.h"
 #include "candela/core/Log.h"
@@ -98,11 +99,19 @@ void AssetRegistry::scan(const std::filesystem::path& contentDir) {
     uint32_t found = 0;
     for (auto it = std::filesystem::recursive_directory_iterator(contentDir, ec);
          it != std::filesystem::recursive_directory_iterator(); ++it) {
+        // Hidden directories hold derived data (.candela-import .glb caches);
+        // scanning them would duplicate their source assets.
+        if (it->is_directory() &&
+            it->path().filename().string().starts_with('.')) {
+            it.disable_recursion_pending();
+            continue;
+        }
         if (!it->is_regular_file()) {
             continue;
         }
         const auto extension = it->path().extension();
-        if (extension != ".gltf" && extension != ".glb") {
+        if (extension != ".gltf" && extension != ".glb" &&
+            extension != ".blend") {
             continue;
         }
         const AssetGuid guid = ensureMeta(it->path());
@@ -153,7 +162,10 @@ void AssetRegistry::startLoad(AssetGuid guid, Entry& entry) {
 
     const std::filesystem::path path = entry.path;
     JobSystem::submit([this, guid, path] {
-        ModelAsset imported = importGltfModel(m_context, m_bindless, path);
+        ModelAsset imported =
+            path.extension() == ".blend"
+                ? importBlendModel(m_context, m_bindless, path)
+                : importGltfModel(m_context, m_bindless, path);
         std::scoped_lock lock(m_mutex);
         Entry& target = m_entries[guid];
         target.pendingModel = std::make_unique<ModelAsset>(std::move(imported));

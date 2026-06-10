@@ -29,9 +29,9 @@ struct AssetReloadedEvent {
     AssetGuid guid = kInvalidGuid;
 };
 
-// Scans a content directory for importable sources (.gltf/.glb), stamps each
-// with a sidecar `<file>.meta` carrying its GUID, and serves loaded assets by
-// GUID. Loads run on the job system; consumers poll tryGetModel() and draw
+// Scans a content directory for importable sources (.gltf/.glb/.blend),
+// stamps each with a sidecar `<file>.meta` carrying its GUID, and serves
+// loaded assets by GUID. Loads run on the job system; consumers poll tryGetModel() and draw
 // whatever has arrived (progressive streaming by construction). Source files
 // are watched for changes and re-imported in place.
 class AssetRegistry {
