@@ -62,6 +62,12 @@ struct FrameConstants
     uint pad3, pad4;
     InstanceData* instanceData;
     uint pad5, pad6; // uint64 padding would drag in the Int64 capability
+    // Temporal: jitter-free matrices for velocity/reprojection.
+    float4x4 viewProjectionNoJitter;
+    float4x4 prevViewProjectionNoJitter;
+    float2 jitter;
+    uint frameIndex;
+    uint taaEnabled;
 };
 
 static const uint kFlagAlphaMask = 1u << 0;
@@ -88,12 +94,13 @@ float traceVisibility(RaytracingAccelerationStructure tlas, float3 origin,
     return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
 }
 
-// Interleaved gradient noise — stable per-pixel jitter without temporal
-// accumulation machinery (denoising lands later in Phase 5).
-float interleavedGradientNoise(uint2 pixel)
+// Interleaved gradient noise. Pass animate=frameIndex to rotate the pattern
+// per frame (temporal accumulation converges it); 0 keeps it static.
+float interleavedGradientNoise(uint2 pixel, uint animate = 0)
 {
-    return frac(52.9829189 *
-                frac(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+    // Golden-ratio frame offset decorrelates consecutive frames.
+    float2 p = float2(pixel) + float(animate % 64) * 5.588238;
+    return frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
 float3x3 orthonormalBasis(float3 n)

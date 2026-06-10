@@ -79,13 +79,23 @@ public:
     // (e.g. PRESENT_SRC for the backbuffer).
     void setFinalLayout(Handle handle, VkImageLayout layout);
 
+    // Per-pass GPU timestamps. The caller owns the (reset) query pool; the
+    // graph writes a begin/end pair per pass and records names in order.
+    struct GpuTimestamps {
+        VkQueryPool pool = VK_NULL_HANDLE;
+        uint32_t capacity = 0; // total queries (2 per pass)
+        uint32_t next = 0;
+        std::vector<std::string> names;
+    };
+
     // Default view of a graph resource (for bindless registration).
     VkImageView view(Handle handle) const { return m_resources[handle].view; }
     VkImage image(Handle handle) const { return m_resources[handle].image; }
 
     // Records barriers, dynamic rendering scopes, and pass bodies.
-    // tracyCtx may be null.
-    void execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx);
+    // tracyCtx and timestamps may be null.
+    void execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx,
+                 GpuTimestamps* timestamps = nullptr);
 
 private:
     struct ResourceState {

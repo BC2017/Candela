@@ -31,4 +31,8 @@ struct IBL {
 IBL precomputeIBL(Context& context, ShaderCache& shaders,
                   const std::filesystem::path& hdriPath);
 
+// 1×1 black stand-in (valid bindless descriptors, zero contribution) so the
+// real bake can be deferred until there is geometry to light.
+IBL placeholderIBL(Context& context);
+
 } // namespace candela

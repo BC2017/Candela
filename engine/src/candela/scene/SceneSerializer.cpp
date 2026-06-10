@@ -49,6 +49,7 @@ nlohmann::json worldToJson(const World& world) {
     settings["rtShadows"] = world.settings.rtShadows;
     settings["rtAmbientOcclusion"] = world.settings.rtAmbientOcclusion;
     settings["rtReflections"] = world.settings.rtReflections;
+    settings["taa"] = world.settings.taa;
     scene["settings"] = settings;
 
     // Stable order: iterate the Name storage (every entity has one) in
@@ -116,6 +117,7 @@ void worldFromJson(World& world, AssetRegistry& assets,
         world.settings.rtAmbientOcclusion =
             settings.value("rtAmbientOcclusion", true);
         world.settings.rtReflections = settings.value("rtReflections", true);
+        world.settings.taa = settings.value("taa", true);
     }
 
     std::vector<entt::entity> entities;

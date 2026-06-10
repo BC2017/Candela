@@ -32,6 +32,24 @@ enum class DebugView : uint32_t {
     Reflections = 6,
 };
 
+// Per-frame renderer diagnostics (editor Stats panel). GPU timings resolve a
+// couple of frames late (read back when the recording frame's fence clears).
+struct GpuPassTiming {
+    std::string name;
+    float milliseconds = 0.0f;
+};
+
+struct RenderStats {
+    uint32_t drawCalls = 0; // scene draws per geometry pass
+    uint32_t triangles = 0;
+    uint32_t pointLights = 0;
+    uint32_t rtInstances = 0;
+    bool rayTracingSupported = false;
+    VkExtent2D sceneExtent{};
+    float gpuTotalMs = 0.0f;
+    std::vector<GpuPassTiming> gpuPasses;
+};
+
 // Editor-facing per-frame options. With viewportExtent set, the scene renders
 // into a persistent offscreen image (shown by the editor's viewport panel)
 // and the swapchain receives only the UI pass.
@@ -71,6 +89,13 @@ public:
     // otherwise entt id + 1. Ready once that frame's fence has recycled.
     std::optional<uint32_t> takePickResult();
 
+    // Saves the next presented backbuffer to a PNG (written a couple of
+    // frames later when the GPU work completes). Headless-friendly
+    // verification and flythrough capture.
+    void requestScreenshot(std::filesystem::path path);
+
+    const RenderStats& stats() const { return m_stats; }
+
     Context& context() { return *m_context; }
     Bindless& bindless() { return *m_bindless; }
 
@@ -102,7 +127,11 @@ private:
         GpuBuffer instanceData; // InstanceDataGPU[], mapped
         void* instanceDataMapped = nullptr;
         uint32_t tlasSlot = 0; // bindless AccelStruct index
+        // GPU pass timings (2 timestamps per pass).
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        std::vector<std::string> timestampNames;
     };
+    static constexpr uint32_t kMaxTimestampQueries = 64;
 
     struct PipelineDesc {
         std::string shaderFile;
@@ -149,11 +178,24 @@ private:
     void buildTLAS(VkCommandBuffer cmd, FrameData& frame,
                    uint32_t instanceCount);
 
+    // Ping-pong history pair for temporal accumulation (AO, reflections,
+    // TAA). Persistent across frames; invalidated on resize.
+    struct TemporalTarget {
+        GpuImage images[2];
+        bool everUsed[2] = {false, false};
+        uint32_t writeIndex = 0;
+        bool valid = false; // false → accumulation pass copies raw through
+    };
+
     void recreateSwapchain();
     void checkShaderHotReload();
     void ensureViewportImage(VkExtent2D extent);
+    void ensureTemporalTarget(TemporalTarget& target, VkExtent2D extent);
+    void destroyTemporalTarget(TemporalTarget& target);
+    uint32_t storageSlotFor(VkImageView view);
     void updateFrameConstants(FrameData& frame, const Camera& camera,
-                              const World& world, float aspect);
+                              const World& world, float aspect,
+                              VkExtent2D sceneExtent);
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                         const Camera& camera, const World& world,
                         const RenderOptions& options);
@@ -181,12 +223,24 @@ private:
     VkPipeline m_bloomUpPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
     VkPipeline m_reflectionsPipeline = VK_NULL_HANDLE; // null without RT
+    VkPipeline m_aoPipeline = VK_NULL_HANDLE;          // null without RT
+    VkPipeline m_temporalPipeline = VK_NULL_HANDLE;
 
     static constexpr uint32_t kMaxRTInstances = 1024;
     static constexpr uint32_t kMaxRTInstanceData = 4096;
     bool m_rtSupported = false;
     uint32_t m_rtInstanceCount = 0; // filled per frame before recording
     std::unordered_map<VkImageView, uint32_t> m_storageSlots;
+
+    TemporalTarget m_aoTemporal;
+    TemporalTarget m_reflectionsTemporal;
+    TemporalTarget m_taaTemporal;
+
+    glm::mat4 m_prevViewProjNoJitter{1.0f};
+    bool m_hasPrevViewProj = false;
+    uint64_t m_frameCounter = 0;
+
+    RenderStats m_stats;
 
     // Persistent shadow cascade array (D32, kShadowMapSize², 4 layers).
     GpuImage m_shadowMap;
@@ -195,6 +249,8 @@ private:
     bool m_shadowMapEverRendered = false;
 
     IBL m_ibl;
+    IBL m_iblPlaceholder; // retired after the real bake; freed in the dtor
+    bool m_iblReady = false;
     uint32_t m_irradianceSlot = 0;
     uint32_t m_prefilteredSlot = 0;
     uint32_t m_brdfLutSlot = 0;
@@ -216,6 +272,14 @@ private:
     uint32_t m_pickFrameSlot = UINT32_MAX; // frame slot that recorded the copy
     bool m_pickPending = false;
     std::optional<uint32_t> m_pickResult;
+
+    // One in-flight screenshot readback.
+    GpuBuffer m_screenshotBuffer;
+    void* m_screenshotMapped = nullptr;
+    std::filesystem::path m_screenshotPath; // empty = none requested
+    VkExtent2D m_screenshotExtent{};
+    uint32_t m_screenshotFrameSlot = UINT32_MAX;
+    bool m_screenshotPending = false;
 
     TracyVkCtx m_tracyCtx = nullptr;
 

@@ -18,7 +18,8 @@ struct LightingPush
     float iblIntensity;
     uint prefilteredMips;
     uint debugView; // 0 final, 1 albedo, 2 normals, 3 metal/rough, 4 AO, 5 cascades, 6 reflections
-    uint reflectionTexture; // RT reflections buffer (when rtFlags has kRTReflections)
+    uint reflectionTexture; // accumulated RT reflections (kRTReflections)
+    uint aoTexture;         // accumulated RT AO (kRTAmbientOcclusion)
 };
 
 [[vk::push_constant]] ConstantBuffer<LightingPush> gPush;
@@ -142,30 +143,11 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float3 V = normalize(frame.cameraPosition.xyz - worldPos);
     float viewDepth = length(frame.cameraPosition.xyz - worldPos);
 
-    // Ray-traced ambient occlusion: short cosine-hemisphere rays, jittered
-    // per pixel with IGN (temporal accumulation arrives with denoising).
+    // Ray-traced AO: traced + temporally accumulated by their own passes;
+    // the lighting pass just samples the converged result.
     if ((frame.rtFlags & kRTAmbientOcclusion) != 0)
     {
-        const uint kAORays = 8;
-        const float kAORange = 0.8;
-        float3x3 basis = orthonormalBasis(N);
-        float rotation = interleavedGradientNoise(uint2(input.position.xy)) *
-                         6.28318530;
-        float visible = 0.0;
-        [unroll]
-        for (uint i = 0; i < kAORays; ++i)
-        {
-            float u1 = (float(i) + 0.5) / float(kAORays);
-            float phi = rotation + 2.39996323 * float(i); // golden angle
-            float cosTheta = sqrt(1.0 - u1);
-            float sinTheta = sqrt(u1);
-            float3 local =
-                float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
-            float3 dir = normalize(mul(local, basis));
-            visible += traceVisibility(gTLAS[frame.tlasSlot],
-                                       worldPos + N * 0.02, dir, kAORange);
-        }
-        occlusion = min(occlusion, visible / float(kAORays));
+        occlusion = min(occlusion, gTextures[gPush.aoTexture].Sample(uv).r);
     }
 
     // Debug views short-circuit shading.

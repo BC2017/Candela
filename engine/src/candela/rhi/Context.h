@@ -38,6 +38,8 @@ public:
     // RT effects must fall back to raster when false.
     bool rayTracingSupported() const { return m_rayTracingSupported; }
     uint32_t scratchAlignment() const { return m_scratchAlignment; }
+    // Nanoseconds per timestamp tick (GPU profiling).
+    float timestampPeriod() const { return m_timestampPeriod; }
 
     void waitIdle() const;
 
@@ -71,6 +73,7 @@ private:
     mutable std::mutex m_immediateMutex;
     bool m_rayTracingSupported = false;
     uint32_t m_scratchAlignment = 256;
+    float m_timestampPeriod = 1.0f;
     std::string m_gpuName;
 };
 

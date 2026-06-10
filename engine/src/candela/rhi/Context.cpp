@@ -122,6 +122,7 @@ Context::Context(Window& window) {
     vkb::PhysicalDevice vkbPhysical = physicalResult.value();
     m_physicalDevice = vkbPhysical.physical_device;
     m_gpuName = vkbPhysical.properties.deviceName;
+    m_timestampPeriod = vkbPhysical.properties.limits.timestampPeriod;
     CD_INFO("Selected GPU: {} (driver {}.{}.{})", m_gpuName,
             VK_VERSION_MAJOR(vkbPhysical.properties.driverVersion),
             VK_VERSION_MINOR(vkbPhysical.properties.driverVersion),

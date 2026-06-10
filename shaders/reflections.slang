@@ -71,7 +71,7 @@ void csMain(uint3 id : SV_DispatchThreadID)
     }
     else
     {
-        float noise = interleavedGradientNoise(id.xy);
+        float noise = interleavedGradientNoise(id.xy, frame.frameIndex);
         float2 xi = float2(noise, frac(noise * 7.0 + 0.31));
         float3 H = importanceSampleGGX(xi, N, roughness);
         R = reflect(-V, H);

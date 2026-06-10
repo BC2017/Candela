@@ -1,7 +1,8 @@
 build/
 out/
 # Test content downloaded by scripts/get-assets.ps1 — not committed.
-assets/
+# Root-anchored: must NOT match engine/src/candela/assets/.
+/assets/
 .vs/
 .vscode/
 .idea/

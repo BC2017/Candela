@@ -63,6 +63,9 @@ struct SceneSettings {
     bool rtShadows = true;
     bool rtAmbientOcclusion = true;
     bool rtReflections = true;
+    // Temporal anti-aliasing (also drives sub-pixel jitter; the RT temporal
+    // accumulation works regardless).
+    bool taa = true;
 };
 
 } // namespace candela

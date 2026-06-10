@@ -39,6 +39,10 @@ EditorApp::EditorApp(Window& window, Renderer& renderer, AssetRegistry& assets,
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
+    // Layout persistence must not depend on the working directory — pin the
+    // ini next to the project content.
+    m_iniPath = (m_assetDir.parent_path() / "imgui.ini").string();
+    io.IniFilename = m_iniPath.c_str();
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     // The engine manages cursor capture for mouse-look; stop the backend
     // from fighting it.
@@ -140,16 +144,20 @@ RenderOptions EditorApp::frame(World& world, float dt) {
             center, ImGuiDir_Left, 0.16f, nullptr, &center);
         ImGuiID right = ImGui::DockBuilderSplitNode(center, ImGuiDir_Right,
                                                     0.24f, nullptr, &center);
-        const ImGuiID bottom = ImGui::DockBuilderSplitNode(
-            center, ImGuiDir_Down, 0.22f, nullptr, &center);
+        ImGuiID bottom = ImGui::DockBuilderSplitNode(center, ImGuiDir_Down,
+                                                     0.22f, nullptr, &center);
         const ImGuiID rightBottom = ImGui::DockBuilderSplitNode(
             right, ImGuiDir_Down, 0.45f, nullptr, &right);
+        const ImGuiID bottomRight = ImGui::DockBuilderSplitNode(
+            bottom, ImGuiDir_Right, 0.40f, nullptr, &bottom);
         ImGui::DockBuilderDockWindow("Hierarchy", left);
         ImGui::DockBuilderDockWindow("Inspector", right);
         ImGui::DockBuilderDockWindow("Scene Settings", rightBottom);
         ImGui::DockBuilderDockWindow("Content", bottom);
+        ImGui::DockBuilderDockWindow("Stats", bottomRight);
         ImGui::DockBuilderDockWindow("Viewport", center);
         ImGui::DockBuilderFinish(dockspaceId);
+        m_statsDockId = bottomRight;
     }
 
     drawMenuBar(world);
@@ -158,6 +166,7 @@ RenderOptions EditorApp::frame(World& world, float dt) {
     drawInspector(world);
     drawContentBrowser(world);
     drawSceneSettings(world);
+    drawStats(world, dt);
     handleShortcuts(world);
 
     // Camera: fly with RMB over the viewport; orbit with Alt+LMB.
@@ -207,10 +216,44 @@ void EditorApp::drawMenuBar(World& world) {
         return;
     }
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("New Scene", nullptr, false, !m_playing)) {
+            world.registry.clear();
+            world.settings = {};
+            m_commands.clear();
+            m_selected = 0;
+            m_scenePath = m_assetDir / "scenes" / "untitled.candela";
+        }
+        if (ImGui::BeginMenu("Open Scene", !m_playing)) {
+            const std::filesystem::path scenesDir = m_assetDir / "scenes";
+            bool any = false;
+            if (std::filesystem::exists(scenesDir)) {
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(scenesDir)) {
+                    if (entry.path().extension() != ".candela") {
+                        continue;
+                    }
+                    any = true;
+                    const std::string label =
+                        entry.path().filename().string();
+                    if (ImGui::MenuItem(label.c_str())) {
+                        SceneSerializer::load(world, m_assets, entry.path());
+                        m_scenePath = entry.path();
+                        m_commands.clear();
+                        m_selected = 0;
+                    }
+                }
+            }
+            if (!any) {
+                ImGui::TextDisabled("No saved scenes");
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Save Scene", "Ctrl+S", false, !m_playing)) {
             saveScene(world);
         }
-        if (ImGui::MenuItem("Reload Scene", nullptr, false, !m_playing)) {
+        if (ImGui::MenuItem("Reload Scene", nullptr, false,
+                            !m_playing &&
+                                std::filesystem::exists(m_scenePath))) {
             SceneSerializer::load(world, m_assets, m_scenePath);
             m_commands.clear();
             m_selected = 0;
@@ -365,8 +408,20 @@ void EditorApp::drawViewport(World& world) {
         if (*picked == 0) {
             m_selected = 0;
         } else {
-            const auto entity = static_cast<entt::entity>(*picked - 1);
+            auto entity = static_cast<entt::entity>(*picked - 1);
             if (world.registry.valid(entity)) {
+                // Viewport clicks select the whole group: walk up to the
+                // topmost ancestor so model instances move as one object.
+                // Individual children remain selectable in the Hierarchy.
+                while (true) {
+                    const auto* parent =
+                        world.registry.try_get<Parent>(entity);
+                    if (parent == nullptr ||
+                        !world.registry.valid(parent->value)) {
+                        break;
+                    }
+                    entity = parent->value;
+                }
                 m_selected = editorIdOf(world, entity);
             }
         }
@@ -797,6 +852,15 @@ void EditorApp::drawSceneSettings(World& world) {
                                       m_settingsBefore, settings));
     }
 
+    // Checkboxes commit instantly — snapshot before the toggle.
+    {
+        const SceneSettings before = settings;
+        if (ImGui::Checkbox("TAA", &settings.taa)) {
+            m_commands.perform(world, std::make_unique<SettingsCommand>(
+                                          before, settings));
+        }
+    }
+
     ImGui::SeparatorText("Ray Tracing");
     ImGui::BeginDisabled(!m_renderer.context().rayTracingSupported());
     // Checkboxes commit instantly — snapshot before each toggle.
@@ -816,6 +880,70 @@ void EditorApp::drawSceneSettings(World& world) {
     ImGui::EndDisabled();
 
     ImGui::EndDisabled();
+    ImGui::End();
+}
+
+void EditorApp::drawStats(World& world, float dt) {
+    // Ring buffer of frame times in milliseconds.
+    m_frameTimes[m_frameTimeOffset] = dt * 1000.0f;
+    m_frameTimeOffset = (m_frameTimeOffset + 1) % kFrameHistory;
+
+    if (m_statsDockId != 0) {
+        ImGui::SetNextWindowDockID(m_statsDockId, ImGuiCond_Once);
+    }
+    ImGui::Begin("Stats");
+
+    float sum = 0.0f;
+    float worst = 0.0f;
+    for (float ms : m_frameTimes) {
+        sum += ms;
+        worst = (std::max)(worst, ms);
+    }
+    const float average = sum / kFrameHistory;
+    ImGui::Text("Frame: %.2f ms (%.0f fps)   worst: %.2f ms", average,
+                average > 0.0f ? 1000.0f / average : 0.0f, worst);
+    ImGui::PlotLines("##frametimes", m_frameTimes, kFrameHistory,
+                     m_frameTimeOffset, nullptr, 0.0f, (std::max)(worst, 4.0f),
+                     ImVec2(-1.0f, 48.0f));
+
+    const RenderStats& stats = m_renderer.stats();
+
+    ImGui::SeparatorText("Scene");
+    ImGui::Text("Entities: %zu   Lights: %u",
+                world.registry.storage<Name>().size(), stats.pointLights);
+    ImGui::Text("Draws: %u   Triangles: %.2f M", stats.drawCalls,
+                static_cast<double>(stats.triangles) / 1e6);
+    ImGui::Text("Viewport: %u x %u", stats.sceneExtent.width,
+                stats.sceneExtent.height);
+
+    ImGui::SeparatorText("Ray Tracing");
+    if (stats.rayTracingSupported) {
+        const SceneSettings& settings = world.settings;
+        ImGui::Text("TLAS instances: %u", stats.rtInstances);
+        ImGui::Text("Shadows: %s   AO: %s   Reflections: %s   TAA: %s",
+                    settings.rtShadows ? "RT" : "CSM",
+                    settings.rtAmbientOcclusion ? "RT" : "texture",
+                    settings.rtReflections ? "RT" : "IBL",
+                    settings.taa ? "on" : "off");
+    } else {
+        ImGui::TextDisabled("Not supported on this GPU");
+    }
+
+    ImGui::SeparatorText("GPU Passes");
+    ImGui::Text("Total: %.2f ms", stats.gpuTotalMs);
+    if (ImGui::BeginTable("##gpupasses", 2,
+                          ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+        for (const GpuPassTiming& pass : stats.gpuPasses) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            ImGui::TextUnformatted(pass.name.c_str());
+            ImGui::TableNextColumn();
+            ImGui::Text("%.3f ms", pass.milliseconds);
+        }
+        ImGui::EndTable();
+    }
+
     ImGui::End();
 }
 
