@@ -138,6 +138,7 @@ Context::Context(Window& window) {
 
 void Context::immediateSubmit(
     const std::function<void(VkCommandBuffer)>& record) const {
+    std::scoped_lock lock(m_immediateMutex);
     VK_CHECK(vkResetCommandBuffer(m_immediateCmd, 0));
 
     VkCommandBufferBeginInfo beginInfo{};
@@ -177,6 +178,9 @@ Context::~Context() {
 }
 
 void Context::waitIdle() const {
+    // vkDeviceWaitIdle requires external sync with queue submission — hold
+    // the immediate-submit mutex so worker-thread uploads can't race it.
+    std::scoped_lock lock(m_immediateMutex);
     VK_CHECK(vkDeviceWaitIdle(m_device));
 }
 

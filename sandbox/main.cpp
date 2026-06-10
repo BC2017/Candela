@@ -1,8 +1,13 @@
+#include <candela/assets/AssetRegistry.h>
+#include <candela/core/Events.h>
+#include <candela/core/Jobs.h>
 #include <candela/core/Log.h>
+#include <candela/platform/Input.h>
 #include <candela/platform/Window.h>
 #include <candela/renderer/Camera.h>
 #include <candela/renderer/Renderer.h>
-#include <candela/scene/GltfScene.h>
+#include <candela/scene/SceneSerializer.h>
+#include <candela/scene/World.h>
 
 #include <tracy/Tracy.hpp>
 
@@ -12,89 +17,166 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <sstream>
+
+namespace {
+
+// Builds the demo scene in code: Sponza + four colonnade lights + settings.
+void buildDefaultScene(candela::World& world, candela::AssetRegistry& assets,
+                       candela::AssetGuid sponzaGuid) {
+    world.instantiateModel(assets, sponzaGuid);
+
+    struct LightSpec {
+        glm::vec3 position;
+        glm::vec3 color;
+    };
+    const LightSpec lightSpecs[] = {
+        {{-9.5f, 1.6f, 1.2f}, {1.0f, 0.55f, 0.25f}},
+        {{-9.5f, 1.6f, -1.8f}, {1.0f, 0.55f, 0.25f}},
+        {{9.0f, 1.6f, 1.2f}, {0.3f, 0.55f, 1.0f}},
+        {{9.0f, 1.6f, -1.8f}, {0.3f, 0.55f, 1.0f}},
+    };
+    int lightIndex = 0;
+    for (const LightSpec& spec : lightSpecs) {
+        const entt::entity entity =
+            world.createEntity(std::format("light_{}", lightIndex++));
+        world.registry.get<candela::LocalTransform>(entity).translation =
+            spec.position;
+        auto& light =
+            world.registry.emplace<candela::PointLightComponent>(entity);
+        light.color = spec.color;
+        light.intensity = 2.5f;
+        light.radius = 8.0f;
+    }
+
+    world.settings = {}; // defaults documented in Components.h
+}
+
+std::string readFileText(const std::filesystem::path& path) {
+    std::ifstream file(path);
+    std::ostringstream stream;
+    stream << file.rdbuf();
+    return stream.str();
+}
+
+} // namespace
 
 int main(int argc, char** argv) {
     candela::Log::init();
-    CD_INFO("Candela sandbox — Phase 2");
+    CD_INFO("Candela sandbox — Phase 3");
 
-    // --frames N: exit after N frames (used by automated verification).
     uint64_t maxFrames = 0;
-    for (int i = 1; i < argc - 1; ++i) {
-        if (std::strcmp(argv[i], "--frames") == 0) {
+    bool roundtripCheck = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--roundtrip-check") == 0) {
+            roundtripCheck = true;
         }
     }
 
-    candela::Window window{candela::WindowDesc{}};
-    candela::Renderer renderer{window};
+    candela::JobSystem::init();
 
-    const std::filesystem::path scenePath =
-        std::filesystem::path(CANDELA_ASSET_DIR) / "Sponza" / "glTF" /
-        "Sponza.gltf";
-    if (std::filesystem::exists(scenePath)) {
-        renderer.setScene(candela::loadGltfScene(renderer.context(),
-                                                 renderer.bindless(),
-                                                 scenePath));
-    } else {
-        CD_WARN("Scene not found: {} — run scripts/get-assets.ps1 to download "
-                "Sponza. Rendering an empty world.",
-                scenePath.string());
-    }
+    {
+        candela::Window window{candela::WindowDesc{}};
+        candela::Renderer renderer{window};
+        candela::EventBus events;
+        candela::AssetRegistry assets{renderer.context(), renderer.bindless(),
+                                      events};
 
-    candela::Camera camera;
-    camera.position = {-7.0f, 1.8f, -0.5f};
-    camera.yawRadians = glm::radians(-90.0f);
+        events.subscribe<candela::AssetReloadedEvent>(
+            [&assets](const candela::AssetReloadedEvent& event) {
+                CD_INFO("Asset ready: {}",
+                        assets.pathForGuid(event.guid).filename().string());
+            });
 
-    // Sun angled to fall through Sponza's atrium opening, plus warm fill
-    // lights along the colonnade.
-    candela::LightSetup lights;
-    lights.toSun = glm::normalize(glm::vec3(0.25f, 1.0f, 0.12f));
-    lights.sunIntensity = 6.0f;
-    lights.sunColor = {1.0f, 0.96f, 0.88f};
-    lights.iblIntensity = 0.8f;
-    lights.exposure = 1.0f;
-    lights.bloomStrength = 0.05f;
-    lights.pointLights = {
-        {{-9.5f, 1.6f, 1.2f}, 8.0f, {1.0f, 0.55f, 0.25f}, 2.5f},
-        {{-9.5f, 1.6f, -1.8f}, 8.0f, {1.0f, 0.55f, 0.25f}, 2.5f},
-        {{9.0f, 1.6f, 1.2f}, 8.0f, {0.3f, 0.55f, 1.0f}, 2.5f},
-        {{9.0f, 1.6f, -1.8f}, 8.0f, {0.3f, 0.55f, 1.0f}, 2.5f},
-    };
+        const std::filesystem::path assetDir{CANDELA_ASSET_DIR};
+        assets.scan(assetDir);
 
-    uint64_t frameCount = 0;
-    uint32_t framesThisSecond = 0;
-    auto lastTitleUpdate = std::chrono::steady_clock::now();
-    auto lastFrameTime = lastTitleUpdate;
-
-    while (!window.shouldClose()) {
-        window.pollEvents();
-
-        const auto now = std::chrono::steady_clock::now();
-        const float dt =
-            std::chrono::duration<float>(now - lastFrameTime).count();
-        lastFrameTime = now;
-
-        camera.update(window, dt);
-        renderer.drawFrame(camera, lights);
-        FrameMark;
-
-        ++frameCount;
-        ++framesThisSecond;
-        if (now - lastTitleUpdate >= std::chrono::seconds(1)) {
-            const float ms = 1000.0f / static_cast<float>(framesThisSecond);
-            window.setTitle(std::format(
-                "Candela — Phase 2 | {:.2f} ms ({} fps) | RMB look, WASD move",
-                ms, framesThisSecond));
-            framesThisSecond = 0;
-            lastTitleUpdate = now;
+        candela::World world;
+        const std::filesystem::path scenePath =
+            assetDir / "scenes" / "sponza.candela";
+        if (std::filesystem::exists(scenePath)) {
+            candela::SceneSerializer::load(world, assets, scenePath);
+        } else {
+            const candela::AssetGuid sponzaGuid = assets.guidForPath(
+                assetDir / "Sponza" / "glTF" / "Sponza.gltf");
+            if (sponzaGuid != candela::kInvalidGuid) {
+                buildDefaultScene(world, assets, sponzaGuid);
+            } else {
+                CD_WARN("Sponza not found — run scripts/get-assets.ps1. "
+                        "Starting with an empty scene.");
+            }
+            std::filesystem::create_directories(scenePath.parent_path());
+            candela::SceneSerializer::save(world, scenePath);
         }
 
-        if (maxFrames != 0 && frameCount >= maxFrames) {
-            CD_INFO("Reached frame limit ({}), exiting", maxFrames);
-            break;
+        if (roundtripCheck) {
+            // Exit-criteria proof: saving the just-loaded/just-built world
+            // must reproduce the scene file byte for byte.
+            const std::filesystem::path checkPath =
+                std::filesystem::temp_directory_path() /
+                "candela-roundtrip.candela";
+            candela::World reloaded;
+            candela::SceneSerializer::load(reloaded, assets, scenePath);
+            candela::SceneSerializer::save(reloaded, checkPath);
+            const bool identical =
+                readFileText(scenePath) == readFileText(checkPath);
+            CD_INFO("Scene round-trip check: {}",
+                    identical ? "PASS" : "FAIL");
+            if (!identical) {
+                return 1;
+            }
         }
+
+        candela::Camera camera;
+        camera.position = {-7.0f, 1.8f, -0.5f};
+        camera.yawRadians = glm::radians(-90.0f);
+        const candela::InputActions input =
+            candela::InputActions::flyCameraDefaults();
+
+        uint64_t frameCount = 0;
+        uint32_t framesThisSecond = 0;
+        auto lastTitleUpdate = std::chrono::steady_clock::now();
+        auto lastFrameTime = lastTitleUpdate;
+
+        while (!window.shouldClose()) {
+            window.pollEvents();
+
+            const auto now = std::chrono::steady_clock::now();
+            const float dt =
+                std::chrono::duration<float>(now - lastFrameTime).count();
+            lastFrameTime = now;
+
+            assets.update();
+            camera.update(window, input, dt);
+            world.updateTransforms();
+            renderer.drawFrame(camera, world, assets);
+            FrameMark;
+
+            ++frameCount;
+            ++framesThisSecond;
+            if (now - lastTitleUpdate >= std::chrono::seconds(1)) {
+                const float ms =
+                    1000.0f / static_cast<float>(framesThisSecond);
+                window.setTitle(std::format(
+                    "Candela — Phase 3 | {:.2f} ms ({} fps) | {} entities",
+                    ms, framesThisSecond,
+                    world.registry.storage<candela::Name>().size()));
+                framesThisSecond = 0;
+                lastTitleUpdate = now;
+            }
+
+            if (maxFrames != 0 && frameCount >= maxFrames) {
+                CD_INFO("Reached frame limit ({}), exiting", maxFrames);
+                break;
+            }
+        }
+
+        CD_INFO("Shutting down after {} frames", frameCount);
     }
 
-    CD_INFO("Shutting down after {} frames", frameCount);
+    candela::JobSystem::shutdown();
     return 0;
 }

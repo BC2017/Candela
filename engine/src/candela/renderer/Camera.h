@@ -5,13 +5,14 @@
 namespace candela {
 
 class Window;
+class InputActions;
 
-// Fly camera: WASD + QE to move (Shift to sprint), hold right mouse to look.
+// Fly camera driven by InputActions ("move_*", "sprint", "look").
 // Produces a reverse-Z infinite perspective projection (depth 1 at the near
 // plane, 0 at infinity) with the Vulkan Y flip handled by a negative viewport.
 class Camera {
 public:
-    void update(Window& window, float dt);
+    void update(Window& window, const InputActions& input, float dt);
 
     glm::mat4 view() const;
     glm::mat4 projection(float aspect) const;

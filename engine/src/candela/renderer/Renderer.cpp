@@ -1,8 +1,10 @@
 #include "candela/renderer/Renderer.h"
 
+#include "candela/assets/AssetRegistry.h"
 #include "candela/platform/Window.h"
 #include "candela/renderer/Camera.h"
 #include "candela/renderer/Cascades.h"
+#include "candela/scene/World.h"
 
 #include <tracy/Tracy.hpp>
 
@@ -181,7 +183,6 @@ Renderer::Renderer(Window& window) : m_window(window) {
 Renderer::~Renderer() {
     m_context->waitIdle();
 
-    m_scene.destroy(*m_context);
     m_ibl.destroy(*m_context);
     for (VkImageView view : m_shadowLayerViews) {
         if (view != VK_NULL_HANDLE) {
@@ -214,12 +215,6 @@ Renderer::~Renderer() {
     m_bindless.reset();
     m_swapchain.reset();
     m_context.reset();
-}
-
-void Renderer::setScene(Scene scene) {
-    m_context->waitIdle();
-    m_scene.destroy(*m_context);
-    m_scene = std::move(scene);
 }
 
 void Renderer::createFrameData() {
@@ -541,9 +536,10 @@ uint32_t Renderer::slotFor(VkImageView view) {
 }
 
 void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
-                                    const LightSetup& lights, float aspect) {
+                                    const World& world, float aspect) {
+    const SceneSettings& settings = world.settings;
     const CascadeSet cascades =
-        computeCascades(camera, aspect, lights.toSun, kMaxShadowDistance,
+        computeCascades(camera, aspect, settings.toSun, kMaxShadowDistance,
                         kShadowMapSize);
 
     FrameConstants constants{};
@@ -555,12 +551,12 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
     constants.cascadeSplits = cascades.splitDepths;
     constants.cameraPosition = glm::vec4(camera.position, 1.0f);
     constants.sunDirection =
-        glm::vec4(glm::normalize(lights.toSun), lights.sunIntensity);
-    constants.sunColor = glm::vec4(lights.sunColor, 0.0f);
-    constants.pointLightCount = (std::min)(
-        static_cast<uint32_t>(lights.pointLights.size()), 8u);
+        glm::vec4(glm::normalize(settings.toSun), settings.sunIntensity);
+    constants.sunColor = glm::vec4(settings.sunColor, 0.0f);
+    constants.pointLightCount =
+        (std::min)(static_cast<uint32_t>(m_frameLights.size()), 8u);
     for (uint32_t i = 0; i < constants.pointLightCount; ++i) {
-        const PointLightDesc& light = lights.pointLights[i];
+        const FrameLight& light = m_frameLights[i];
         constants.pointLights[i].positionRadius =
             glm::vec4(light.position, light.radius);
         constants.pointLights[i].colorIntensity =
@@ -571,7 +567,7 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
 }
 
 void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
-                              const Camera& camera, const LightSetup& lights) {
+                              const Camera& camera, const World& world) {
     ZoneScoped;
 
     FrameData& frame = m_frames[m_frameIndex];
@@ -582,8 +578,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
 
     // CPU-side cascade matrices are needed for shadow draw pushes too.
     const CascadeSet cascades =
-        computeCascades(camera, aspect, lights.toSun, kMaxShadowDistance,
-                        kShadowMapSize);
+        computeCascades(camera, aspect, world.settings.toSun,
+                        kMaxShadowDistance, kShadowMapSize);
 
     VkCommandBufferBeginInfo beginInfo{};
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -642,17 +638,19 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             VkDescriptorSet set = m_bindless->set();
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
-            for (const DrawItem& draw : m_scene.draws) {
+            for (const FrameDraw& draw : m_frameDraws) {
                 ShadowPush push{};
                 push.lightViewProjModel = cascadeMatrix * draw.transform;
-                push.vertices = draw.vertexAddress;
+                push.vertices = draw.primitive->vertexBuffer.deviceAddress;
                 vkCmdPushConstants(passCmd, m_pipelineLayout,
                                    VK_SHADER_STAGE_VERTEX_BIT |
                                        VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0, sizeof(push), &push);
-                vkCmdBindIndexBuffer(passCmd, draw.indexBuffer, 0,
+                vkCmdBindIndexBuffer(passCmd,
+                                     draw.primitive->indexBuffer.buffer, 0,
                                      VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(passCmd, draw.indexCount, 1, 0, 0, 0);
+                vkCmdDrawIndexed(passCmd, draw.primitive->indexCount, 1, 0, 0,
+                                 0);
             }
         };
         graph.addPass(std::move(pass));
@@ -678,26 +676,28 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             VkDescriptorSet set = m_bindless->set();
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
-            for (const DrawItem& draw : m_scene.draws) {
+            for (const FrameDraw& draw : m_frameDraws) {
+                const GpuPrimitive& primitive = *draw.primitive;
                 GBufferPush push{};
                 push.model = draw.transform;
-                push.vertices = draw.vertexAddress;
+                push.vertices = primitive.vertexBuffer.deviceAddress;
                 push.frame = frameAddress;
-                push.albedoTexture = draw.albedoTexture;
-                push.normalTexture = draw.normalTexture;
-                push.metallicRoughnessTexture = draw.metallicRoughnessTexture;
-                push.occlusionTexture = draw.occlusionTexture;
-                push.flags = draw.flags;
-                push.metallicFactor = draw.metallicFactor;
-                push.roughnessFactor = draw.roughnessFactor;
-                push.baseColorFactor = draw.baseColorFactor;
+                push.albedoTexture = primitive.albedoTexture;
+                push.normalTexture = primitive.normalTexture;
+                push.metallicRoughnessTexture =
+                    primitive.metallicRoughnessTexture;
+                push.occlusionTexture = primitive.occlusionTexture;
+                push.flags = primitive.flags;
+                push.metallicFactor = primitive.metallicFactor;
+                push.roughnessFactor = primitive.roughnessFactor;
+                push.baseColorFactor = primitive.baseColorFactor;
                 vkCmdPushConstants(passCmd, m_pipelineLayout,
                                    VK_SHADER_STAGE_VERTEX_BIT |
                                        VK_SHADER_STAGE_FRAGMENT_BIT,
                                    0, sizeof(push), &push);
-                vkCmdBindIndexBuffer(passCmd, draw.indexBuffer, 0,
+                vkCmdBindIndexBuffer(passCmd, primitive.indexBuffer.buffer, 0,
                                      VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(passCmd, draw.indexCount, 1, 0, 0, 0);
+                vkCmdDrawIndexed(passCmd, primitive.indexCount, 1, 0, 0, 0);
             }
         };
         graph.addPass(std::move(pass));
@@ -722,7 +722,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.brdfLut = m_brdfLutSlot;
         push.invResolution = {1.0f / static_cast<float>(extent.width),
                               1.0f / static_cast<float>(extent.height)};
-        push.iblIntensity = lights.iblIntensity;
+        push.iblIntensity = world.settings.iblIntensity;
         push.prefilteredMips = IBL::kPrefilteredMips;
         pass.execute = [this, extent, push](VkCommandBuffer passCmd) {
             setFullViewport(passCmd, extent);
@@ -845,8 +845,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         TonemapPush push{};
         push.hdrTexture = slotFor(graph.view(hdr));
         push.bloomTexture = slotFor(graph.view(bloomLevels[0]));
-        push.exposure = lights.exposure;
-        push.bloomStrength = lights.bloomStrength;
+        push.exposure = world.settings.exposure;
+        push.bloomStrength = world.settings.bloomStrength;
         push.invResolution = {1.0f / static_cast<float>(extent.width),
                               1.0f / static_cast<float>(extent.height)};
         pass.execute = [this, extent, push](VkCommandBuffer passCmd) {
@@ -877,7 +877,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
 
-void Renderer::drawFrame(const Camera& camera, const LightSetup& lights) {
+void Renderer::drawFrame(const Camera& camera, World& world,
+                         AssetRegistry& assets) {
     ZoneScoped;
 
     checkShaderHotReload();
@@ -888,6 +889,27 @@ void Renderer::drawFrame(const Camera& camera, const LightSetup& lights) {
     }
     if (m_window.consumeResizeFlag()) {
         recreateSwapchain();
+    }
+
+    // Assemble this frame's draws and lights from the ECS. Models still
+    // importing simply contribute nothing yet.
+    m_frameDraws.clear();
+    m_frameLights.clear();
+    for (auto [entity, transform, mesh] :
+         world.registry.view<WorldTransform, MeshRenderer>().each()) {
+        const ModelAsset* model = assets.tryGetModel(mesh.model);
+        if (model == nullptr || mesh.meshIndex >= model->meshes.size()) {
+            continue;
+        }
+        for (const GpuPrimitive& primitive :
+             model->meshes[mesh.meshIndex].primitives) {
+            m_frameDraws.push_back({transform.value, &primitive});
+        }
+    }
+    for (auto [entity, transform, light] :
+         world.registry.view<WorldTransform, PointLightComponent>().each()) {
+        m_frameLights.push_back({glm::vec3(transform.value[3]), light.radius,
+                                 light.color, light.intensity});
     }
 
     FrameData& frame = m_frames[m_frameIndex];
@@ -909,14 +931,14 @@ void Renderer::drawFrame(const Camera& camera, const LightSetup& lights) {
               "vkAcquireNextImageKHR failed: {}", string_VkResult(acquireResult));
 
     const VkExtent2D extent = m_swapchain->extent();
-    updateFrameConstants(frame, camera, lights,
+    updateFrameConstants(frame, camera, world,
                          static_cast<float>(extent.width) /
                              static_cast<float>(extent.height));
 
     VK_CHECK(vkResetFences(device, 1, &frame.inFlightFence));
     VK_CHECK(vkResetCommandPool(device, frame.pool, 0));
 
-    recordCommands(frame.cmd, imageIndex, camera, lights);
+    recordCommands(frame.cmd, imageIndex, camera, world);
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
@@ -940,8 +962,6 @@ void Renderer::drawFrame(const Camera& camera, const LightSetup& lights) {
     submitInfo.pCommandBufferInfos = &cmdInfo;
     submitInfo.signalSemaphoreInfoCount = 1;
     submitInfo.pSignalSemaphoreInfos = &signalInfo;
-    VK_CHECK(vkQueueSubmit2(m_context->graphicsQueue(), 1, &submitInfo,
-                            frame.inFlightFence));
 
     VkSwapchainKHR swapchain = m_swapchain->handle();
     VkPresentInfoKHR presentInfo{};
@@ -952,8 +972,15 @@ void Renderer::drawFrame(const Camera& camera, const LightSetup& lights) {
     presentInfo.pSwapchains = &swapchain;
     presentInfo.pImageIndices = &imageIndex;
 
-    const VkResult presentResult =
-        vkQueuePresentKHR(m_context->graphicsQueue(), &presentInfo);
+    VkResult presentResult = VK_SUCCESS;
+    {
+        // Serialize against worker-thread asset uploads (immediateSubmit).
+        std::scoped_lock queueLock(m_context->queueMutex());
+        VK_CHECK(vkQueueSubmit2(m_context->graphicsQueue(), 1, &submitInfo,
+                                frame.inFlightFence));
+        presentResult =
+            vkQueuePresentKHR(m_context->graphicsQueue(), &presentInfo);
+    }
     if (presentResult == VK_ERROR_OUT_OF_DATE_KHR ||
         presentResult == VK_SUBOPTIMAL_KHR) {
         recreateSwapchain();

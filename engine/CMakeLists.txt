@@ -1,5 +1,10 @@
 add_library(candela STATIC
+    src/candela/assets/AssetRegistry.cpp
+    src/candela/assets/ModelAsset.cpp
+    src/candela/assets/StbUsage.cpp
+    src/candela/core/Jobs.cpp
     src/candela/core/Log.cpp
+    src/candela/platform/Input.cpp
     src/candela/platform/Window.cpp
     src/candela/rhi/Bindless.cpp
     src/candela/rhi/Context.cpp
@@ -12,25 +17,25 @@ add_library(candela STATIC
     src/candela/renderer/Cascades.cpp
     src/candela/renderer/IBL.cpp
     src/candela/renderer/Renderer.cpp
-    src/candela/scene/GltfScene.cpp
-    src/candela/scene/StbUsage.cpp
+    src/candela/scene/SceneSerializer.cpp
+    src/candela/scene/World.cpp
 )
 
 target_include_directories(candela PUBLIC src)
 
 if(MSVC)
   # fastgltf's accessor templates trip C4100 when instantiated under /W4.
-  set_source_files_properties(src/candela/scene/GltfScene.cpp
+  set_source_files_properties(src/candela/assets/ModelAsset.cpp
       PROPERTIES COMPILE_OPTIONS "/wd4100")
 else()
   # Same warning, GCC spelling; -Wredundant-move fires inside fastgltf 0.8
   # headers (fixed upstream after our pinned tag).
-  set_source_files_properties(src/candela/scene/GltfScene.cpp
+  set_source_files_properties(src/candela/assets/ModelAsset.cpp
       PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-redundant-move")
   # Third-party implementation TUs are too warning-heavy for -Wall -Werror.
   set_source_files_properties(
       src/candela/rhi/VmaUsage.cpp
-      src/candela/scene/StbUsage.cpp
+      src/candela/assets/StbUsage.cpp
       PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
@@ -54,6 +59,8 @@ target_link_libraries(candela PUBLIC
     Vulkan::Headers
     fastgltf::fastgltf
     stb
+    EnTT::EnTT
+    nlohmann_json::nlohmann_json
 )
 
 candela_apply_warnings(candela)

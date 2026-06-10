@@ -2,6 +2,8 @@
 
 #include "candela/rhi/VulkanCommon.h"
 
+#include <mutex>
+
 namespace candela {
 
 class Context;
@@ -26,6 +28,7 @@ public:
     Bindless(const Bindless&) = delete;
     Bindless& operator=(const Bindless&) = delete;
 
+    // Thread-safe: asset imports register textures from job threads.
     uint32_t add(Kind kind, VkImageView view, VkSampler sampler);
     void update(Kind kind, uint32_t index, VkImageView view, VkSampler sampler);
 
@@ -47,6 +50,7 @@ private:
     VkSampler m_defaultSampler = VK_NULL_HANDLE;
     VkSampler m_clampSampler = VK_NULL_HANDLE;
     uint32_t m_nextIndex[3] = {0, 0, 0};
+    std::mutex m_mutex;
 };
 
 } // namespace candela

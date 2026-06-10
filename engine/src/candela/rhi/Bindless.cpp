@@ -109,6 +109,7 @@ void Bindless::write(Kind kind, uint32_t index, VkImageView view,
 }
 
 uint32_t Bindless::add(Kind kind, VkImageView view, VkSampler sampler) {
+    std::scoped_lock lock(m_mutex);
     const uint32_t slot = static_cast<uint32_t>(kind);
     CD_ASSERT(m_nextIndex[slot] < kBindingCounts[slot],
               "Bindless binding {} full", slot);
@@ -119,6 +120,7 @@ uint32_t Bindless::add(Kind kind, VkImageView view, VkSampler sampler) {
 
 void Bindless::update(Kind kind, uint32_t index, VkImageView view,
                       VkSampler sampler) {
+    std::scoped_lock lock(m_mutex);
     CD_ASSERT(index < m_nextIndex[static_cast<uint32_t>(kind)],
               "update() of unallocated bindless slot {}", index);
     write(kind, index, view, sampler);

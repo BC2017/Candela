@@ -1,12 +1,12 @@
 #pragma once
 
+#include "candela/assets/ModelAsset.h"
 #include "candela/renderer/IBL.h"
 #include "candela/rhi/Bindless.h"
 #include "candela/rhi/Context.h"
 #include "candela/rhi/RenderGraph.h"
 #include "candela/rhi/ShaderCompiler.h"
 #include "candela/rhi/Swapchain.h"
-#include "candela/scene/GltfScene.h"
 
 #include <chrono>
 #include <filesystem>
@@ -18,27 +18,13 @@ namespace candela {
 
 class Window;
 class Camera;
+class World;
+class AssetRegistry;
 
-struct PointLightDesc {
-    glm::vec3 position{0.0f};
-    float radius = 10.0f;
-    glm::vec3 color{1.0f};
-    float intensity = 1.0f;
-};
-
-struct LightSetup {
-    glm::vec3 toSun = glm::normalize(glm::vec3(0.2f, 0.9f, 0.15f));
-    float sunIntensity = 5.0f;
-    glm::vec3 sunColor{1.0f, 0.97f, 0.92f};
-    float iblIntensity = 1.0f;
-    float exposure = 1.0f;
-    float bloomStrength = 0.04f;
-    std::vector<PointLightDesc> pointLights; // first 8 are used
-};
-
-// Phase 2 renderer: deferred PBR through the render graph —
-// 4 shadow cascades → G-buffer → Cook-Torrance + IBL lighting → dual-Kawase
-// bloom → ACES tonemap. All shaders hot-reload as a group.
+// Deferred PBR through the render graph — 4 shadow cascades → G-buffer →
+// Cook-Torrance + IBL lighting → dual-Kawase bloom → ACES tonemap. Draws,
+// lights, and scene settings come from the ECS world; geometry referenced by
+// MeshRenderers streams in as the asset registry finishes imports.
 class Renderer {
 public:
     explicit Renderer(Window& window);
@@ -47,8 +33,7 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    void setScene(Scene scene);
-    void drawFrame(const Camera& camera, const LightSetup& lights);
+    void drawFrame(const Camera& camera, World& world, AssetRegistry& assets);
 
     Context& context() { return *m_context; }
     Bindless& bindless() { return *m_bindless; }
@@ -89,15 +74,29 @@ private:
     void createPresentSemaphores();
     void destroyPresentSemaphores();
 
+    // A primitive scheduled for this frame (assembled from the ECS each
+    // frame; 100s of draws — revisit when scenes grow).
+    struct FrameDraw {
+        glm::mat4 transform;
+        const GpuPrimitive* primitive;
+    };
+
+    struct FrameLight {
+        glm::vec3 position;
+        float radius;
+        glm::vec3 color;
+        float intensity;
+    };
+
     VkPipeline buildPipeline(const PipelineDesc& desc);
     bool createPipelines();
 
     void recreateSwapchain();
     void checkShaderHotReload();
     void updateFrameConstants(FrameData& frame, const Camera& camera,
-                              const LightSetup& lights, float aspect);
+                              const World& world, float aspect);
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
-                        const Camera& camera, const LightSetup& lights);
+                        const Camera& camera, const World& world);
 
     // Stable bindless slot for a (typically transient) image view, sampled
     // with the clamp sampler. Slots are appended, never freed — acceptable
@@ -135,7 +134,8 @@ private:
 
     std::unordered_map<VkImageView, uint32_t> m_viewSlots;
 
-    Scene m_scene;
+    std::vector<FrameDraw> m_frameDraws;
+    std::vector<FrameLight> m_frameLights;
     TracyVkCtx m_tracyCtx = nullptr;
 
     std::filesystem::path m_shaderDir;
