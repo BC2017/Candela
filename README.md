@@ -84,7 +84,7 @@ EnTT ECS (transform hierarchy, mesh renderers, lights, per-scene settings in reg
 **Phase 2** — deferred PBR pipeline, fully render-graph driven:
 4 shadow cascades (texel-snapped, PCF) → G-buffer (albedo / octahedral normals / metallic-roughness-AO) → Cook-Torrance GGX lighting with sun + point lights and split-sum IBL (GPU-precomputed irradiance, GGX-prefiltered specular, BRDF LUT from a Poly Haven HDRI) → dual-Kawase bloom → ACES tonemap. Full glTF material loading: normal mapping with tangents, metallic-roughness, occlusion, sRGB-aware texture cache. Sponza renders validation-clean at ~550 fps (debug, 1600×900, RTX 5080); all shaders hot-reload as a group.
 
-Run `scripts\get-assets.ps1` once to download the Sponza test scene and HDRI.
+Run `scripts\get-assets.ps1` once to download the test content: Sponza, FlightHelmet, DamagedHelmet, MetalRoughSpheres (Khronos glTF samples), and a Poly Haven HDRI. All models appear in the editor's content browser; the sandbox can view one directly with auto-framing: `candela-sandbox --model assets\FlightHelmet\glTF\FlightHelmet.gltf` (add `--no-rt` to isolate the raster path, `--screenshot out.png --frames 1500` for headless captures). MetalRoughSpheres matches the Khronos reference render; DamagedHelmet is correct except its emissive visor glow (emissive support is a known deferral).
 
 Deferred to later phases: emissive + velocity G-buffer targets (TAA/denoising), sky rendering from the environment cube, alpha-tested shadows, IBL disk caching, KTX2/BC texture compression (Phase 3 asset pipeline). Phase 1: render graph, bindless, glTF. Phase 0: Vulkan bring-up, Slang hot reload.
 

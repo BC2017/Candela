@@ -1,4 +1,5 @@
 #include <candela/assets/AssetRegistry.h>
+#include <candela/assets/ModelAsset.h>
 #include <candela/core/Events.h>
 #include <candela/core/Jobs.h>
 #include <candela/core/Log.h>
@@ -69,6 +70,8 @@ int main(int argc, char** argv) {
     uint64_t maxFrames = 0;
     bool roundtripCheck = false;
     std::filesystem::path screenshotPath;
+    std::filesystem::path modelPath; // view a single model instead of a scene
+    bool noRT = false;               // isolate raster path (debugging aid)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -76,6 +79,10 @@ int main(int argc, char** argv) {
             roundtripCheck = true;
         } else if (std::strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
             screenshotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            modelPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--no-rt") == 0) {
+            noRT = true;
         }
     }
 
@@ -98,9 +105,45 @@ int main(int argc, char** argv) {
         assets.scan(assetDir);
 
         candela::World world;
+        candela::Camera camera;
+        camera.position = {-7.0f, 1.8f, -0.5f};
+        camera.yawRadians = glm::radians(-90.0f);
+
         const std::filesystem::path scenePath =
             assetDir / "scenes" / "sponza.candela";
-        if (std::filesystem::exists(scenePath)) {
+        if (!modelPath.empty()) {
+            // Model-viewer mode: one model, default sun + IBL, auto-framed.
+            const candela::AssetGuid guid =
+                assets.guidForPath(std::filesystem::absolute(modelPath));
+            if (guid == candela::kInvalidGuid) {
+                CD_ERROR("Model not in the asset registry: {}",
+                         modelPath.string());
+                return 1;
+            }
+            world.instantiateModel(assets, guid);
+            world.settings = {};
+            if (noRT) {
+                world.settings.rtShadows = false;
+                world.settings.rtAmbientOcclusion = false;
+                world.settings.rtReflections = false;
+            }
+
+            const candela::ModelAsset* model = assets.getModelBlocking(guid);
+            const glm::vec3 center =
+                (model->boundsMin + model->boundsMax) * 0.5f;
+            const float radius = (std::max)(
+                glm::length(model->boundsMax - model->boundsMin) * 0.5f,
+                0.01f);
+            camera.position =
+                center + glm::normalize(glm::vec3(1.0f, 0.45f, 1.0f)) *
+                             radius * 1.9f;
+            const glm::vec3 toCenter =
+                glm::normalize(center - camera.position);
+            camera.pitchRadians = std::asin(toCenter.y);
+            camera.yawRadians = std::atan2(-toCenter.x, -toCenter.z);
+            CD_INFO("Model viewer: {} (radius {:.2f} m)",
+                    modelPath.filename().string(), radius);
+        } else if (std::filesystem::exists(scenePath)) {
             candela::SceneSerializer::load(world, assets, scenePath);
         } else {
             const candela::AssetGuid sponzaGuid = assets.guidForPath(
@@ -133,9 +176,6 @@ int main(int argc, char** argv) {
             }
         }
 
-        candela::Camera camera;
-        camera.position = {-7.0f, 1.8f, -0.5f};
-        camera.yawRadians = glm::radians(-90.0f);
         const candela::InputActions input =
             candela::InputActions::flyCameraDefaults();
 
