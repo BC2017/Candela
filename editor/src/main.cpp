@@ -119,6 +119,7 @@ int main(int argc, char** argv) {
     bool selftest = false;
     uint64_t maxFrames = 0;
     std::filesystem::path screenshotPath;
+    std::filesystem::path openScenePath;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) {
             selftest = true;
@@ -126,6 +127,8 @@ int main(int argc, char** argv) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
         } else if (std::strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
             screenshotPath = argv[i + 1];
+        } else if (std::strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
+            openScenePath = argv[i + 1];
         }
     }
 
@@ -143,16 +146,20 @@ int main(int argc, char** argv) {
 
         const std::filesystem::path assetDir{CANDELA_ASSET_DIR};
         assets.scan(assetDir);
-        const std::filesystem::path scenePath =
-            assetDir / "scenes" / "sponza.candela";
 
+        // The editor starts with an empty untitled scene; saved scenes load
+        // via File > Open Scene or --scene <path>.
         World world;
-        if (std::filesystem::exists(scenePath)) {
-            SceneSerializer::load(world, assets, scenePath);
-        } else {
-            CD_WARN("No scene at {} — starting empty (run the sandbox once "
-                    "or save from the editor)",
-                    scenePath.string());
+        std::filesystem::path scenePath =
+            assetDir / "scenes" / "untitled.candela";
+        if (!openScenePath.empty()) {
+            if (std::filesystem::exists(openScenePath)) {
+                SceneSerializer::load(world, assets, openScenePath);
+                scenePath = openScenePath;
+            } else {
+                CD_WARN("Scene not found: {} — starting empty",
+                        openScenePath.string());
+            }
         }
 
         EditorApp editor{window, renderer, assets, assetDir, scenePath};
@@ -166,6 +173,10 @@ int main(int argc, char** argv) {
             if (!runCommandSelftest(world, assets, sponza)) {
                 exitCode = 1;
             }
+            // Geometry for the pick test below — the empty startup scene
+            // would otherwise have nothing to hit.
+            world.instantiateModel(assets, sponza);
+            assignEditorIds(world);
             if (maxFrames == 0) {
                 maxFrames = 240; // run on for the pick selftest below
             }

@@ -216,10 +216,44 @@ void EditorApp::drawMenuBar(World& world) {
         return;
     }
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("New Scene", nullptr, false, !m_playing)) {
+            world.registry.clear();
+            world.settings = {};
+            m_commands.clear();
+            m_selected = 0;
+            m_scenePath = m_assetDir / "scenes" / "untitled.candela";
+        }
+        if (ImGui::BeginMenu("Open Scene", !m_playing)) {
+            const std::filesystem::path scenesDir = m_assetDir / "scenes";
+            bool any = false;
+            if (std::filesystem::exists(scenesDir)) {
+                for (const auto& entry :
+                     std::filesystem::directory_iterator(scenesDir)) {
+                    if (entry.path().extension() != ".candela") {
+                        continue;
+                    }
+                    any = true;
+                    const std::string label =
+                        entry.path().filename().string();
+                    if (ImGui::MenuItem(label.c_str())) {
+                        SceneSerializer::load(world, m_assets, entry.path());
+                        m_scenePath = entry.path();
+                        m_commands.clear();
+                        m_selected = 0;
+                    }
+                }
+            }
+            if (!any) {
+                ImGui::TextDisabled("No saved scenes");
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Save Scene", "Ctrl+S", false, !m_playing)) {
             saveScene(world);
         }
-        if (ImGui::MenuItem("Reload Scene", nullptr, false, !m_playing)) {
+        if (ImGui::MenuItem("Reload Scene", nullptr, false,
+                            !m_playing &&
+                                std::filesystem::exists(m_scenePath))) {
             SceneSerializer::load(world, m_assets, m_scenePath);
             m_commands.clear();
             m_selected = 0;
