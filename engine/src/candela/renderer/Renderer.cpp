@@ -6,10 +6,12 @@
 #include "candela/renderer/Cascades.h"
 #include "candela/scene/World.h"
 
+#include <stb_image_write.h>
 #include <tracy/Tracy.hpp>
 
 #include <algorithm>
 #include <cstring>
+#include <vector>
 
 namespace candela {
 
@@ -37,8 +39,14 @@ struct FrameConstants {
     uint32_t pad3, pad4;
     VkDeviceAddress instanceData; // InstanceDataGPU*
     uint64_t pad5;
+    // Temporal: jitter-free matrices for velocity/reprojection.
+    glm::mat4 viewProjectionNoJitter;
+    glm::mat4 prevViewProjectionNoJitter;
+    glm::vec2 jitter; // NDC offset applied to the raster projection
+    uint32_t frameIndex;
+    uint32_t taaEnabled;
 };
-static_assert(sizeof(FrameConstants) == 752,
+static_assert(sizeof(FrameConstants) == 896,
               "FrameConstants must match common.slang");
 
 // Per-TLAS-geometry shading data for ray-query hit evaluation.
@@ -98,7 +106,29 @@ struct LightingPush {
     float iblIntensity;
     uint32_t prefilteredMips;
     uint32_t debugView;
-    uint32_t reflectionTexture; // RT reflections buffer (when rtFlags bit 2)
+    uint32_t reflectionTexture; // accumulated RT reflections (bit 2)
+    uint32_t aoTexture;         // accumulated RT AO (bit 1)
+};
+
+struct AOPush {
+    VkDeviceAddress frame;
+    uint32_t gbNormal;
+    uint32_t gbDepth;
+    uint32_t outputImage;
+    uint32_t pad; // slang aligns uint2 to 8 — keep resolution at offset 24
+    glm::uvec2 resolution;
+};
+static_assert(offsetof(AOPush, resolution) == 24,
+              "AOPush must match ao.slang");
+
+struct TemporalPush {
+    uint32_t rawTexture;
+    uint32_t historyTexture;
+    uint32_t outputImage;
+    uint32_t velocityTexture;
+    glm::uvec2 resolution;
+    float blendFactor;
+    uint32_t historyValid;
 };
 
 struct ReflectionsPush {
@@ -413,7 +443,11 @@ Renderer::~Renderer() {
     m_context->waitIdle();
 
     destroyBuffer(*m_context, m_pickBuffer);
+    destroyBuffer(*m_context, m_screenshotBuffer);
     destroyImage(*m_context, m_viewportImage);
+    destroyTemporalTarget(m_aoTemporal);
+    destroyTemporalTarget(m_reflectionsTemporal);
+    destroyTemporalTarget(m_taaTemporal);
     m_ibl.destroy(*m_context);
     for (VkImageView view : m_shadowLayerViews) {
         if (view != VK_NULL_HANDLE) {
@@ -432,7 +466,7 @@ Renderer::~Renderer() {
     for (VkPipeline pipeline :
          {m_gbufferPipeline, m_shadowPipeline, m_lightingPipeline,
           m_bloomDownPipeline, m_bloomUpPipeline, m_tonemapPipeline,
-          m_reflectionsPipeline}) {
+          m_reflectionsPipeline, m_aoPipeline, m_temporalPipeline}) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
         }
@@ -687,7 +721,8 @@ bool Renderer::createPipelines() {
     gbuffer.shaderFile = "gbuffer.slang";
     gbuffer.fsEntry = "fsMain";
     gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16_UNORM,
-                            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT};
+                            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT,
+                            VK_FORMAT_R16G16_SFLOAT};
     gbuffer.depthFormat = kDepthFormat;
     gbuffer.depthTest = true;
     gbuffer.depthWrite = true;
@@ -721,17 +756,20 @@ bool Renderer::createPipelines() {
     tonemap.fsEntry = "fsMain";
     tonemap.colorFormats = {m_swapchain->format()};
 
-    VkPipeline newPipelines[7] = {
+    VkPipeline newPipelines[9] = {
         buildPipeline(gbuffer),
         buildPipeline(shadow),
         buildPipeline(lighting),
         buildPipeline(bloomDown),
         buildPipeline(bloomUp),
         buildPipeline(tonemap),
+        buildComputePipeline("temporal.slang", "csMain"),
         m_rtSupported ? buildComputePipeline("reflections.slang", "csMain")
                       : VK_NULL_HANDLE,
+        m_rtSupported ? buildComputePipeline("ao.slang", "csMain")
+                      : VK_NULL_HANDLE,
     };
-    const uint32_t required = m_rtSupported ? 7u : 6u;
+    const uint32_t required = m_rtSupported ? 9u : 7u;
     for (uint32_t i = 0; i < required; ++i) {
         if (newPipelines[i] == VK_NULL_HANDLE) {
             for (VkPipeline created : newPipelines) {
@@ -743,17 +781,53 @@ bool Renderer::createPipelines() {
         }
     }
 
-    VkPipeline* slots[7] = {&m_gbufferPipeline,   &m_shadowPipeline,
+    VkPipeline* slots[9] = {&m_gbufferPipeline,   &m_shadowPipeline,
                             &m_lightingPipeline,  &m_bloomDownPipeline,
                             &m_bloomUpPipeline,   &m_tonemapPipeline,
-                            &m_reflectionsPipeline};
-    for (uint32_t i = 0; i < 7; ++i) {
+                            &m_temporalPipeline,  &m_reflectionsPipeline,
+                            &m_aoPipeline};
+    for (uint32_t i = 0; i < 9; ++i) {
         if (*slots[i] != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_context->device(), *slots[i], nullptr);
         }
         *slots[i] = newPipelines[i];
     }
     return true;
+}
+
+void Renderer::ensureTemporalTarget(TemporalTarget& target, VkExtent2D extent) {
+    if (target.images[0].image != VK_NULL_HANDLE &&
+        target.images[0].extent.width == extent.width &&
+        target.images[0].extent.height == extent.height) {
+        return;
+    }
+    m_context->waitIdle();
+    destroyTemporalTarget(target);
+    for (GpuImage& image : target.images) {
+        image = createImage2D(*m_context, kHdrFormat, extent,
+                              VK_IMAGE_USAGE_STORAGE_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT);
+    }
+    target.everUsed[0] = false;
+    target.everUsed[1] = false;
+    target.writeIndex = 0;
+    target.valid = false;
+}
+
+void Renderer::destroyTemporalTarget(TemporalTarget& target) {
+    for (GpuImage& image : target.images) {
+        destroyImage(*m_context, image);
+    }
+}
+
+uint32_t Renderer::storageSlotFor(VkImageView view) {
+    if (auto it = m_storageSlots.find(view); it != m_storageSlots.end()) {
+        return it->second;
+    }
+    const uint32_t slot =
+        m_bindless->add(Bindless::Kind::StorageImage, view, VK_NULL_HANDLE);
+    m_storageSlots.emplace(view, slot);
+    return slot;
 }
 
 void Renderer::ensureViewportImage(VkExtent2D extent) {
@@ -775,6 +849,14 @@ std::optional<uint32_t> Renderer::takePickResult() {
     auto result = m_pickResult;
     m_pickResult.reset();
     return result;
+}
+
+void Renderer::requestScreenshot(std::filesystem::path path) {
+    if (m_screenshotPending) {
+        CD_WARN("Screenshot already in flight, ignoring request");
+        return;
+    }
+    m_screenshotPath = std::move(path);
 }
 
 void Renderer::recreateSwapchain() {
@@ -827,16 +909,55 @@ uint32_t Renderer::slotFor(VkImageView view) {
     return slot;
 }
 
+namespace {
+
+float haltonSequence(uint32_t index, uint32_t base) {
+    float result = 0.0f;
+    float fraction = 1.0f / static_cast<float>(base);
+    while (index > 0) {
+        result += fraction * static_cast<float>(index % base);
+        index /= base;
+        fraction /= static_cast<float>(base);
+    }
+    return result;
+}
+
+} // namespace
+
 void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
-                                    const World& world, float aspect) {
+                                    const World& world, float aspect,
+                                    VkExtent2D sceneExtent) {
     const SceneSettings& settings = world.settings;
     const CascadeSet cascades =
         computeCascades(camera, aspect, settings.toSun, kMaxShadowDistance,
                         kShadowMapSize);
 
     FrameConstants constants{};
-    constants.viewProjection = camera.viewProjection(aspect);
+    const glm::mat4 viewProjNoJitter = camera.viewProjection(aspect);
+
+    // Sub-pixel projection jitter (Halton 2,3 over 8 frames) when TAA is on.
+    glm::vec2 jitter{0.0f};
+    if (settings.taa) {
+        const uint32_t phase = static_cast<uint32_t>(m_frameCounter % 8) + 1;
+        jitter = {(haltonSequence(phase, 2) - 0.5f) * 2.0f /
+                      static_cast<float>(sceneExtent.width),
+                  (haltonSequence(phase, 3) - 0.5f) * 2.0f /
+                      static_cast<float>(sceneExtent.height)};
+    }
+    glm::mat4 jitteredProj = camera.projection(aspect);
+    jitteredProj[2][0] += jitter.x; // column 2 scales by -z, so this lands as
+    jitteredProj[2][1] += jitter.y; // a constant NDC offset after the w divide
+
+    constants.viewProjection = jitteredProj * camera.view();
     constants.invViewProjection = glm::inverse(constants.viewProjection);
+    constants.viewProjectionNoJitter = viewProjNoJitter;
+    constants.prevViewProjectionNoJitter =
+        m_hasPrevViewProj ? m_prevViewProjNoJitter : viewProjNoJitter;
+    constants.jitter = jitter;
+    constants.frameIndex = static_cast<uint32_t>(m_frameCounter);
+    constants.taaEnabled = settings.taa ? 1u : 0u;
+    m_prevViewProjNoJitter = viewProjNoJitter;
+    m_hasPrevViewProj = true;
     for (uint32_t i = 0; i < CascadeSet::kCount; ++i) {
         constants.cascadeViewProjection[i] = cascades.viewProjection[i];
     }
@@ -855,7 +976,9 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
             glm::vec4(light.color, light.intensity);
     }
 
-    if (m_rtSupported) {
+    // Zero instances (e.g. model still importing) means the TLAS and the
+    // RT passes don't run this frame — the shader must not sample them.
+    if (m_rtSupported && m_rtInstanceCount > 0) {
         constants.rtFlags =
             (settings.rtShadows ? kRTShadowsBit : 0) |
             (settings.rtAmbientOcclusion ? kRTAOBit : 0) |
@@ -943,6 +1066,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         "gb-entity-id", VK_FORMAT_R32_UINT, extent,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    const RenderGraph::Handle gbVelocity = graph.createImage(
+        "gb-velocity", VK_FORMAT_R16G16_SFLOAT, extent,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
     const RenderGraph::Handle depth = graph.createImage(
         "depth", kDepthFormat, extent,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -951,8 +1077,67 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         "hdr", kHdrFormat, extent,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 
-    // --- Shadow cascades ---
-    for (uint32_t cascade = 0; cascade < CascadeSet::kCount; ++cascade) {
+    // Imports one half of a ping-pong history pair with its tracked state.
+    auto importTemporal = [&](TemporalTarget& target, uint32_t index,
+                              const char* name) {
+        const RenderGraph::Handle handle = graph.importImage(
+            name, target.images[index].image, target.images[index].view,
+            kHdrFormat, extent,
+            target.everUsed[index] ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                   : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        target.everUsed[index] = true;
+        return handle;
+    };
+
+    // Accumulates `raw` into the target's history; returns the converged
+    // image (this frame's write half) for downstream sampling.
+    auto addTemporalPass = [&](const char* name, TemporalTarget& target,
+                               RenderGraph::Handle raw, float blendFactor) {
+        const uint32_t write = target.writeIndex;
+        const uint32_t read = 1 - write;
+        const RenderGraph::Handle historyHandle =
+            importTemporal(target, read, name);
+        const RenderGraph::Handle outputHandle =
+            importTemporal(target, write, name);
+
+        RenderGraph::Pass pass;
+        pass.name = std::string(name) + "-accumulate";
+        pass.sampledImages = {raw, historyHandle, gbVelocity};
+        pass.storageImages = {outputHandle};
+        TemporalPush push{};
+        push.rawTexture = slotFor(graph.view(raw));
+        push.historyTexture = slotFor(graph.view(historyHandle));
+        push.outputImage = storageSlotFor(graph.view(outputHandle));
+        push.velocityTexture = slotFor(graph.view(gbVelocity));
+        push.resolution = {extent.width, extent.height};
+        push.blendFactor = blendFactor;
+        push.historyValid = target.valid ? 1u : 0u;
+        const VkExtent2D dispatchExtent = extent;
+        pass.execute = [this, push, dispatchExtent](VkCommandBuffer passCmd) {
+            vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              m_temporalPipeline);
+            VkDescriptorSet set = m_bindless->set();
+            vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    m_pipelineLayout, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages, 0,
+                               sizeof(push), &push);
+            vkCmdDispatch(passCmd, (dispatchExtent.width + 7) / 8,
+                          (dispatchExtent.height + 7) / 8, 1);
+        };
+        graph.addPass(std::move(pass));
+
+        target.valid = true;
+        target.writeIndex = read;
+        return outputHandle;
+    };
+
+    // --- Shadow cascades (skipped entirely when RT shadows replace them) ---
+    const bool useRTShadows = rtActive && world.settings.rtShadows;
+    for (uint32_t cascade = 0;
+         !useRTShadows && cascade < CascadeSet::kCount; ++cascade) {
         RenderGraph::Pass pass;
         pass.name = "shadow-cascade-" + std::to_string(cascade);
         RenderGraph::Attachment depthAttachment;
@@ -995,6 +1180,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             {gbNormal, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbMaterial, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbEntityId, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
+            {gbVelocity, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
         };
         RenderGraph::Attachment depthAttachment;
         depthAttachment.handle = depth;
@@ -1084,6 +1270,48 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         graph.addPass(std::move(pass));
     }
 
+    // --- Temporal accumulation of the RT effects ---
+    RenderGraph::Handle reflectionsAccumulated = 0;
+    if (reflectionsActive) {
+        reflectionsAccumulated = addTemporalPass(
+            "rt-reflections", m_reflectionsTemporal, rtReflections, 0.1f);
+    }
+
+    // --- RT ambient occlusion (compute) + accumulation ---
+    RenderGraph::Handle aoAccumulated = 0;
+    const bool aoActive = rtActive && world.settings.rtAmbientOcclusion &&
+                          m_aoPipeline != VK_NULL_HANDLE;
+    if (aoActive) {
+        const RenderGraph::Handle aoRaw = graph.createImage(
+            "rt-ao", kHdrFormat, extent,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+        RenderGraph::Pass pass;
+        pass.name = "rt-ao";
+        pass.sampledImages = {gbNormal, depth};
+        pass.storageImages = {aoRaw};
+        AOPush push{};
+        push.frame = frameAddress;
+        push.gbNormal = slotFor(graph.view(gbNormal));
+        push.gbDepth = slotFor(graph.view(depth));
+        push.outputImage = storageSlotFor(graph.view(aoRaw));
+        push.resolution = {extent.width, extent.height};
+        const VkExtent2D dispatchExtent = extent;
+        pass.execute = [this, push, dispatchExtent](VkCommandBuffer passCmd) {
+            vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              m_aoPipeline);
+            VkDescriptorSet set = m_bindless->set();
+            vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    m_pipelineLayout, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages, 0,
+                               sizeof(push), &push);
+            vkCmdDispatch(passCmd, (dispatchExtent.width + 7) / 8,
+                          (dispatchExtent.height + 7) / 8, 1);
+        };
+        graph.addPass(std::move(pass));
+
+        aoAccumulated = addTemporalPass("rt-ao", m_aoTemporal, aoRaw, 0.15f);
+    }
+
     // --- Deferred lighting ---
     {
         RenderGraph::Pass pass;
@@ -1092,7 +1320,10 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             {hdr, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}}};
         pass.sampledImages = {gbAlbedo, gbNormal, gbMaterial, depth, shadowMap};
         if (reflectionsActive) {
-            pass.sampledImages.push_back(rtReflections);
+            pass.sampledImages.push_back(reflectionsAccumulated);
+        }
+        if (aoActive) {
+            pass.sampledImages.push_back(aoAccumulated);
         }
         LightingPush push{};
         push.frame = frameAddress;
@@ -1110,7 +1341,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.prefilteredMips = IBL::kPrefilteredMips;
         push.debugView = static_cast<uint32_t>(options.debugView);
         push.reflectionTexture =
-            reflectionsActive ? slotFor(graph.view(rtReflections)) : 0;
+            reflectionsActive ? slotFor(graph.view(reflectionsAccumulated))
+                              : 0;
+        push.aoTexture = aoActive ? slotFor(graph.view(aoAccumulated)) : 0;
         pass.execute = [this, extent, push](VkCommandBuffer passCmd) {
             setFullViewport(passCmd, extent);
             vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1125,12 +1358,18 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         graph.addPass(std::move(pass));
     }
 
+    // --- TAA on the HDR scene (before bloom/tonemap) ---
+    RenderGraph::Handle sceneColor = hdr;
+    if (world.settings.taa) {
+        sceneColor = addTemporalPass("taa", m_taaTemporal, hdr, 0.1f);
+    }
+
     // --- Bloom (dual Kawase): downsample chain, then additive upsample ---
     RenderGraph::Handle bloomLevels[kBloomLevels];
     VkExtent2D bloomExtents[kBloomLevels];
     {
         VkExtent2D levelExtent = extent;
-        RenderGraph::Handle source = hdr;
+        RenderGraph::Handle source = sceneColor;
         VkExtent2D sourceExtent = extent;
         for (uint32_t level = 0; level < kBloomLevels; ++level) {
             levelExtent = {(std::max)(levelExtent.width / 2, 1u),
@@ -1222,9 +1461,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                                   {},
                                   VK_NULL_HANDLE,
                                   {}}};
-        pass.sampledImages = {hdr, bloomLevels[0]};
+        pass.sampledImages = {sceneColor, bloomLevels[0]};
         TonemapPush push{};
-        push.hdrTexture = slotFor(graph.view(hdr));
+        push.hdrTexture = slotFor(graph.view(sceneColor));
         push.bloomTexture = slotFor(graph.view(bloomLevels[0]));
         push.exposure = world.settings.exposure;
         push.bloomStrength = world.settings.bloomStrength;
@@ -1271,6 +1510,63 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
 
     graph.setFinalLayout(backbuffer, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     graph.execute(cmd, m_tracyCtx);
+
+    // --- Screenshot readback: whole backbuffer after all passes ---
+    if (!m_screenshotPath.empty() && !m_screenshotPending) {
+        const VkDeviceSize byteSize =
+            VkDeviceSize(swapExtent.width) * swapExtent.height * 4;
+        if (m_screenshotBuffer.buffer == VK_NULL_HANDLE ||
+            m_screenshotBuffer.size < byteSize) {
+            destroyBuffer(*m_context, m_screenshotBuffer);
+            m_screenshotBuffer = createBuffer(
+                *m_context, byteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                    VMA_ALLOCATION_CREATE_MAPPED_BIT);
+            VmaAllocationInfo info{};
+            vmaGetAllocationInfo(m_context->allocator(),
+                                 m_screenshotBuffer.allocation, &info);
+            m_screenshotMapped = info.pMappedData;
+        }
+
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = m_swapchain->image(imageIndex);
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        VkDependencyInfo dependency{};
+        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {swapExtent.width, swapExtent.height, 1};
+        vkCmdCopyImageToBuffer(cmd, m_swapchain->image(imageIndex),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_screenshotBuffer.buffer, 1, &region);
+
+        std::swap(barrier.srcStageMask, barrier.dstStageMask);
+        barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+
+        m_screenshotExtent = swapExtent;
+        m_screenshotFrameSlot = m_frameIndex;
+        m_screenshotPending = true;
+    }
 
     // --- Pick readback: one texel of the entity-ID target ---
     if (options.pickPixel.has_value()) {
@@ -1343,6 +1639,18 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     const VkExtent2D sceneExtent =
         editorMode ? options.viewportExtent : m_swapchain->extent();
 
+    // Temporal history pairs (resize-aware; ensured before any recording so
+    // the waitIdle inside recreation never lands mid-command-buffer).
+    if (world.settings.taa) {
+        ensureTemporalTarget(m_taaTemporal, sceneExtent);
+    }
+    if (m_rtSupported && world.settings.rtAmbientOcclusion) {
+        ensureTemporalTarget(m_aoTemporal, sceneExtent);
+    }
+    if (m_rtSupported && world.settings.rtReflections) {
+        ensureTemporalTarget(m_reflectionsTemporal, sceneExtent);
+    }
+
     // Assemble this frame's draws and lights from the ECS. Models still
     // importing simply contribute nothing yet.
     m_frameDraws.clear();
@@ -1381,6 +1689,26 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         m_pickPending = false;
     }
 
+    // Likewise the screenshot copy — swizzle BGRA→RGBA and write the PNG.
+    if (m_screenshotPending && m_screenshotFrameSlot == m_frameIndex) {
+        const uint32_t width = m_screenshotExtent.width;
+        const uint32_t height = m_screenshotExtent.height;
+        std::vector<uint8_t> rgba(size_t(width) * height * 4);
+        const auto* src = static_cast<const uint8_t*>(m_screenshotMapped);
+        for (size_t i = 0; i < rgba.size(); i += 4) {
+            rgba[i + 0] = src[i + 2];
+            rgba[i + 1] = src[i + 1];
+            rgba[i + 2] = src[i + 0];
+            rgba[i + 3] = 255;
+        }
+        stbi_write_png(m_screenshotPath.string().c_str(),
+                       static_cast<int>(width), static_cast<int>(height), 4,
+                       rgba.data(), static_cast<int>(width) * 4);
+        CD_INFO("Screenshot written: {}", m_screenshotPath.string());
+        m_screenshotPath.clear();
+        m_screenshotPending = false;
+    }
+
     uint32_t imageIndex = 0;
     const VkResult acquireResult =
         vkAcquireNextImageKHR(device, m_swapchain->handle(), UINT64_MAX,
@@ -1395,12 +1723,14 @@ void Renderer::drawFrame(const Camera& camera, World& world,
 
     updateFrameConstants(frame, camera, world,
                          static_cast<float>(sceneExtent.width) /
-                             static_cast<float>(sceneExtent.height));
+                             static_cast<float>(sceneExtent.height),
+                         sceneExtent);
 
     VK_CHECK(vkResetFences(device, 1, &frame.inFlightFence));
     VK_CHECK(vkResetCommandPool(device, frame.pool, 0));
 
     recordCommands(frame.cmd, imageIndex, camera, world, options);
+    ++m_frameCounter;
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;

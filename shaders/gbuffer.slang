@@ -2,6 +2,8 @@
 //   RT0 (RGBA8_SRGB)  albedo.rgb, occlusion strength in a
 //   RT1 (RG16_UNORM)  octahedral world-space normal
 //   RT2 (RGBA8_UNORM) metallic, roughness, AO, unused
+//   RT3 (R32_UINT)    entity id (picking)
+//   RT4 (RG16F)       UV-space velocity (jitter-free) for reprojection
 
 #include "common.slang"
 
@@ -29,6 +31,10 @@ struct VSOut
     float3 worldNormal : NORMAL0;
     float4 worldTangent : TANGENT0;
     float2 uv : TEXCOORD0;
+    // Jitter-free clip positions for velocity (entities are static; the
+    // model matrix doubles as last frame's until per-entity motion exists).
+    float4 clipNoJitter : TEXCOORD1;
+    float4 prevClipNoJitter : TEXCOORD2;
 };
 
 [shader("vertex")]
@@ -39,6 +45,9 @@ VSOut vsMain(uint vertexId : SV_VertexID)
 
     VSOut output;
     output.position = mul(gPush.frame.viewProjection, worldPos);
+    output.clipNoJitter = mul(gPush.frame.viewProjectionNoJitter, worldPos);
+    output.prevClipNoJitter =
+        mul(gPush.frame.prevViewProjectionNoJitter, worldPos);
     // Uniform-scale assumption; a proper normal matrix arrives with the
     // editor's non-uniform-scale support.
     output.worldNormal = normalize(mul((float3x3)gPush.model, v.normal()));
@@ -55,6 +64,7 @@ struct GBufferOut
     float2 normal : SV_Target1;
     float4 material : SV_Target2;
     uint entityId : SV_Target3;
+    float2 velocity : SV_Target4;
 };
 
 [shader("fragment")]
@@ -90,5 +100,10 @@ GBufferOut fsMain(VSOut input)
     output.normal = encodeOctahedral(normal);
     output.material = float4(metallic, roughness, occlusion, 0.0);
     output.entityId = gPush.entityId;
+    // UV-space motion: prevUV = uv - velocity.
+    float2 currUV = ndcToUV(input.clipNoJitter.xy / input.clipNoJitter.w);
+    float2 prevUV =
+        ndcToUV(input.prevClipNoJitter.xy / input.prevClipNoJitter.w);
+    output.velocity = currUV - prevUV;
     return output;
 }

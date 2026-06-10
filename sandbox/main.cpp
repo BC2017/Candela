@@ -68,11 +68,14 @@ int main(int argc, char** argv) {
 
     uint64_t maxFrames = 0;
     bool roundtripCheck = false;
+    std::filesystem::path screenshotPath;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
         } else if (std::strcmp(argv[i], "--roundtrip-check") == 0) {
             roundtripCheck = true;
+        } else if (std::strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
+            screenshotPath = argv[i + 1];
         }
     }
 
@@ -152,6 +155,13 @@ int main(int argc, char** argv) {
             assets.update();
             camera.update(window, input, dt);
             world.updateTransforms();
+
+            // Capture late so async assets and temporal accumulation settle.
+            if (!screenshotPath.empty() && maxFrames != 0 &&
+                frameCount == maxFrames - 10) {
+                renderer.requestScreenshot(screenshotPath);
+            }
+
             renderer.drawFrame(camera, world, assets);
             FrameMark;
 

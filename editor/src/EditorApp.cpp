@@ -797,6 +797,15 @@ void EditorApp::drawSceneSettings(World& world) {
                                       m_settingsBefore, settings));
     }
 
+    // Checkboxes commit instantly — snapshot before the toggle.
+    {
+        const SceneSettings before = settings;
+        if (ImGui::Checkbox("TAA", &settings.taa)) {
+            m_commands.perform(world, std::make_unique<SettingsCommand>(
+                                          before, settings));
+        }
+    }
+
     ImGui::SeparatorText("Ray Tracing");
     ImGui::BeginDisabled(!m_renderer.context().rayTracingSupported());
     // Checkboxes commit instantly — snapshot before each toggle.

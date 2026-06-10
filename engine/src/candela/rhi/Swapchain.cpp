@@ -30,6 +30,8 @@ void Swapchain::create(uint32_t width, uint32_t height) {
                                  VK_COLOR_SPACE_SRGB_NONLINEAR_KHR})
             .set_desired_present_mode(VK_PRESENT_MODE_MAILBOX_KHR)
             .set_desired_extent(width, height)
+            // TRANSFER_SRC for screenshot readback.
+            .add_image_usage_flags(VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
             .set_old_swapchain(old)
             .build();
     CD_ASSERT(result.has_value(), "Failed to create swapchain: {}",
