@@ -55,16 +55,36 @@ bool runCommandSelftest(World& world, AssetRegistry& assets,
                      std::make_unique<DeleteEntityCommand>(snapshotEntity(
                          world, findByEditorId(world, lightId))));
 
+    // Models must group under exactly one new root entity.
+    auto countRoots = [&world] {
+        size_t roots = 0;
+        for (const entt::entity entity : world.registry.view<Name>()) {
+            const auto* parent = world.registry.try_get<Parent>(entity);
+            if (parent == nullptr || !world.registry.valid(parent->value)) {
+                ++roots;
+            }
+        }
+        return roots;
+    };
+    const size_t rootsBefore = countRoots();
     commands.perform(
         world, std::make_unique<InstantiateModelCommand>(modelGuid, assets));
+    const size_t rootsAfter = countRoots();
+    const size_t countAfterAll = world.registry.view<Name>().size();
+    bool pass = rootsAfter == rootsBefore + 1;
+    CD_INFO("Selftest grouping: instantiate added {} root(s) (expected 1) "
+            "=> {}",
+            rootsAfter - rootsBefore, pass ? "PASS" : "FAIL");
+    if (!pass) {
+        return false;
+    }
 
     // Undo all five.
     while (commands.canUndo()) {
         commands.undo(world);
     }
     const size_t afterUndo = world.registry.view<Name>().size();
-    bool pass = afterUndo == count0 &&
-                findByEditorId(world, lightId) == entt::null;
+    pass = afterUndo == count0 && findByEditorId(world, lightId) == entt::null;
     CD_INFO("Selftest undo: entities {} -> {} (expected {}), light gone: {} "
             "=> {}",
             count0, afterUndo, count0,
@@ -74,15 +94,14 @@ bool runCommandSelftest(World& world, AssetRegistry& assets,
         return false;
     }
 
-    // Redo all five. Net: +1 light, -1 light, +1 instantiated root = +1.
+    // Redo all five — back to the exact post-command state.
     while (commands.canRedo()) {
         commands.redo(world);
     }
     const size_t afterRedo = world.registry.view<Name>().size();
-    const size_t expected = count0 + 1;
-    pass = afterRedo == expected;
+    pass = afterRedo == countAfterAll;
     CD_INFO("Selftest redo: entities {} (expected {}) => {}", afterRedo,
-            expected, pass ? "PASS" : "FAIL");
+            countAfterAll, pass ? "PASS" : "FAIL");
 
     // Clean up the redone instantiation so the scene file stays untouched.
     while (commands.canUndo()) {
@@ -99,11 +118,14 @@ int main(int argc, char** argv) {
 
     bool selftest = false;
     uint64_t maxFrames = 0;
+    std::filesystem::path screenshotPath;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--selftest") == 0) {
             selftest = true;
         } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
+        } else if (std::strcmp(argv[i], "--screenshot") == 0 && i + 1 < argc) {
+            screenshotPath = argv[i + 1];
         }
     }
 
@@ -171,6 +193,11 @@ int main(int argc, char** argv) {
                     static_cast<int>(options.viewportExtent.width / 2),
                     static_cast<int>(options.viewportExtent.height / 2));
                 pickIssued = true;
+            }
+
+            if (!screenshotPath.empty() && maxFrames != 0 &&
+                frameCount == maxFrames - 10) {
+                renderer.requestScreenshot(screenshotPath);
             }
 
             world.updateTransforms();

@@ -142,10 +142,18 @@ void RenderGraph::barrierTo(VkCommandBuffer cmd, Resource& resource,
     resource.state = {stage, access, layout};
 }
 
-void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx) {
+void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx,
+                          GpuTimestamps* timestamps) {
     for (Pass& pass : m_passes) {
         TracyVkZoneTransient(tracyCtx, tracyZone, cmd, pass.name.c_str(),
                              tracyCtx != nullptr);
+
+        const bool stamp = timestamps != nullptr &&
+                           timestamps->next + 2 <= timestamps->capacity;
+        if (stamp) {
+            vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                 timestamps->pool, timestamps->next);
+        }
 
         // Barriers for everything the pass touches.
         for (const Attachment& attachment : pass.colorAttachments) {
@@ -178,9 +186,20 @@ void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx) {
                       VK_IMAGE_LAYOUT_GENERAL);
         }
 
+        auto endStamp = [&] {
+            if (stamp) {
+                vkCmdWriteTimestamp2(cmd,
+                                     VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                                     timestamps->pool, timestamps->next + 1);
+                timestamps->names.push_back(pass.name);
+                timestamps->next += 2;
+            }
+        };
+
         // Compute pass: no attachments, no rendering scope.
         if (pass.colorAttachments.empty() && !pass.depthAttachment) {
             pass.execute(cmd);
+            endStamp();
             continue;
         }
 
@@ -234,6 +253,7 @@ void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx) {
         vkCmdBeginRendering(cmd, &renderingInfo);
         pass.execute(cmd);
         vkCmdEndRendering(cmd);
+        endStamp();
     }
 
     // Final layout requests (e.g. backbuffer → PRESENT_SRC).

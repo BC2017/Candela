@@ -508,6 +508,13 @@ void Renderer::createFrameData() {
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         VK_CHECK(vkCreateFence(device, &fenceInfo, nullptr, &frame.inFlightFence));
 
+        VkQueryPoolCreateInfo queryInfo{};
+        queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        queryInfo.queryCount = kMaxTimestampQueries;
+        VK_CHECK(
+            vkCreateQueryPool(device, &queryInfo, nullptr, &frame.queryPool));
+
         frame.constants = createBuffer(
             *m_context, sizeof(FrameConstants),
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
@@ -532,6 +539,7 @@ void Renderer::destroyFrameData() {
             destroyBuffer(*m_context, frame.instanceData);
         }
         destroyBuffer(*m_context, frame.constants);
+        vkDestroyQueryPool(device, frame.queryPool, nullptr);
         vkDestroyFence(device, frame.inFlightFence, nullptr);
         vkDestroySemaphore(device, frame.acquireSemaphore, nullptr);
         vkDestroyCommandPool(device, frame.pool, nullptr);
@@ -1013,6 +1021,12 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
+    // GPU pass timings for this frame slot (read back when its fence clears).
+    vkCmdResetQueryPool(cmd, frame.queryPool, 0, kMaxTimestampQueries);
+    RenderGraph::GpuTimestamps timestamps;
+    timestamps.pool = frame.queryPool;
+    timestamps.capacity = kMaxTimestampQueries;
+
     // TLAS rebuild (cheap at this instance count; prepared in drawFrame).
     const bool rtActive = m_rtSupported && m_rtInstanceCount > 0 &&
                           (world.settings.rtShadows ||
@@ -1020,7 +1034,13 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                            world.settings.rtReflections);
     if (rtActive) {
         TracyVkZone(m_tracyCtx, cmd, "tlas-build");
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                             timestamps.pool, timestamps.next);
         buildTLAS(cmd, frame, m_rtInstanceCount);
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                             timestamps.pool, timestamps.next + 1);
+        timestamps.names.push_back("tlas-build");
+        timestamps.next += 2;
     }
 
     RenderGraph& graph = *m_renderGraph;
@@ -1509,7 +1529,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     }
 
     graph.setFinalLayout(backbuffer, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-    graph.execute(cmd, m_tracyCtx);
+    graph.execute(cmd, m_tracyCtx, &timestamps);
+    frame.timestampNames = std::move(timestamps.names);
 
     // --- Screenshot readback: whole backbuffer after all passes ---
     if (!m_screenshotPath.empty() && !m_screenshotPending) {
@@ -1655,6 +1676,7 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     // importing simply contribute nothing yet.
     m_frameDraws.clear();
     m_frameLights.clear();
+    uint32_t triangles = 0;
     for (auto [entity, transform, mesh] :
          world.registry.view<WorldTransform, MeshRenderer>().each()) {
         const ModelAsset* model = assets.tryGetModel(mesh.model);
@@ -1665,6 +1687,7 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         for (const GpuPrimitive& primitive :
              model->meshes[mesh.meshIndex].primitives) {
             m_frameDraws.push_back({transform.value, &primitive, entityId});
+            triangles += primitive.indexCount / 3;
         }
     }
     for (auto [entity, transform, light] :
@@ -1672,6 +1695,12 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         m_frameLights.push_back({glm::vec3(transform.value[3]), light.radius,
                                  light.color, light.intensity});
     }
+
+    m_stats.drawCalls = static_cast<uint32_t>(m_frameDraws.size());
+    m_stats.triangles = triangles;
+    m_stats.pointLights = static_cast<uint32_t>(m_frameLights.size());
+    m_stats.rayTracingSupported = m_rtSupported;
+    m_stats.sceneExtent = sceneExtent;
 
     FrameData& frame = m_frames[m_frameIndex];
     VkDevice device = m_context->device();
@@ -1682,6 +1711,30 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     // Safe to write this frame slot's RT buffers now that its fence cleared.
     m_rtInstanceCount =
         m_rtSupported ? fillRayTracingInstances(frame, world, assets) : 0;
+    m_stats.rtInstances = m_rtInstanceCount;
+
+    // GPU timings from the work this slot recorded kFramesInFlight ago.
+    if (!frame.timestampNames.empty()) {
+        const uint32_t queryCount =
+            static_cast<uint32_t>(frame.timestampNames.size()) * 2;
+        uint64_t ticks[kMaxTimestampQueries];
+        const VkResult queryResult = vkGetQueryPoolResults(
+            device, frame.queryPool, 0, queryCount,
+            sizeof(uint64_t) * queryCount, ticks, sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT);
+        if (queryResult == VK_SUCCESS) {
+            const float toMs = m_context->timestampPeriod() * 1e-6f;
+            m_stats.gpuPasses.clear();
+            for (size_t i = 0; i < frame.timestampNames.size(); ++i) {
+                const float ms =
+                    static_cast<float>(ticks[i * 2 + 1] - ticks[i * 2]) * toMs;
+                m_stats.gpuPasses.push_back({frame.timestampNames[i], ms});
+            }
+            m_stats.gpuTotalMs =
+                static_cast<float>(ticks[queryCount - 1] - ticks[0]) * toMs;
+        }
+        frame.timestampNames.clear();
+    }
 
     // The pick recorded in this frame slot has now fully executed.
     if (m_pickPending && m_pickFrameSlot == m_frameIndex) {

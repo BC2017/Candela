@@ -49,6 +49,7 @@ private:
     void drawInspector(World& world);
     void drawContentBrowser(World& world);
     void drawSceneSettings(World& world);
+    void drawStats(World& world, float dt);
     void handleShortcuts(World& world);
     void updateViewportTexture();
     void startPlay(World& world);
@@ -62,6 +63,7 @@ private:
     AssetRegistry& m_assets;
     std::filesystem::path m_assetDir;
     std::filesystem::path m_scenePath;
+    std::string m_iniPath; // ImGui layout file (must outlive the context)
 
     Camera m_camera;
     InputActions m_input;
@@ -95,6 +97,12 @@ private:
     DebugView m_debugView = DebugView::Final;
     float m_orbitDistance = 5.0f;
     bool m_showLightGizmos = true;
+
+    // Frame-time history for the Stats panel.
+    static constexpr int kFrameHistory = 180;
+    float m_frameTimes[kFrameHistory] = {};
+    int m_frameTimeOffset = 0;
+    unsigned int m_statsDockId = 0; // ImGuiID from the default layout build
 };
 
 } // namespace candela::editor

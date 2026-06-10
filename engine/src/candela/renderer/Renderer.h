@@ -32,6 +32,24 @@ enum class DebugView : uint32_t {
     Reflections = 6,
 };
 
+// Per-frame renderer diagnostics (editor Stats panel). GPU timings resolve a
+// couple of frames late (read back when the recording frame's fence clears).
+struct GpuPassTiming {
+    std::string name;
+    float milliseconds = 0.0f;
+};
+
+struct RenderStats {
+    uint32_t drawCalls = 0; // scene draws per geometry pass
+    uint32_t triangles = 0;
+    uint32_t pointLights = 0;
+    uint32_t rtInstances = 0;
+    bool rayTracingSupported = false;
+    VkExtent2D sceneExtent{};
+    float gpuTotalMs = 0.0f;
+    std::vector<GpuPassTiming> gpuPasses;
+};
+
 // Editor-facing per-frame options. With viewportExtent set, the scene renders
 // into a persistent offscreen image (shown by the editor's viewport panel)
 // and the swapchain receives only the UI pass.
@@ -76,6 +94,8 @@ public:
     // verification and flythrough capture.
     void requestScreenshot(std::filesystem::path path);
 
+    const RenderStats& stats() const { return m_stats; }
+
     Context& context() { return *m_context; }
     Bindless& bindless() { return *m_bindless; }
 
@@ -107,7 +127,11 @@ private:
         GpuBuffer instanceData; // InstanceDataGPU[], mapped
         void* instanceDataMapped = nullptr;
         uint32_t tlasSlot = 0; // bindless AccelStruct index
+        // GPU pass timings (2 timestamps per pass).
+        VkQueryPool queryPool = VK_NULL_HANDLE;
+        std::vector<std::string> timestampNames;
     };
+    static constexpr uint32_t kMaxTimestampQueries = 64;
 
     struct PipelineDesc {
         std::string shaderFile;
@@ -215,6 +239,8 @@ private:
     glm::mat4 m_prevViewProjNoJitter{1.0f};
     bool m_hasPrevViewProj = false;
     uint64_t m_frameCounter = 0;
+
+    RenderStats m_stats;
 
     // Persistent shadow cascade array (D32, kShadowMapSize², 4 layers).
     GpuImage m_shadowMap;

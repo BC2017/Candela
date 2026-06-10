@@ -66,7 +66,20 @@ std::vector<entt::entity> World::instantiateModel(AssetRegistry& assets,
         return {};
     }
 
-    std::vector<entt::entity> entities(model->nodes.size());
+    // Everything groups under one root entity named after the model so the
+    // instance selects, moves, and deletes as a single object — multi-root
+    // glTFs (e.g. FlightHelmet) would otherwise scatter into siblings.
+    std::string rootName = assets.pathForGuid(guid).stem().string();
+    if (rootName.empty()) {
+        rootName = "Model";
+    }
+    const entt::entity root = createEntity(rootName);
+
+    std::vector<entt::entity> entities;
+    entities.reserve(model->nodes.size() + 1);
+    entities.push_back(root);
+
+    std::vector<entt::entity> nodeEntities(model->nodes.size());
     for (size_t i = 0; i < model->nodes.size(); ++i) {
         const NodeTemplate& node = model->nodes[i];
         const entt::entity entity =
@@ -79,13 +92,14 @@ std::vector<entt::entity> World::instantiateModel(AssetRegistry& assets,
             registry.emplace<MeshRenderer>(
                 entity, guid, static_cast<uint32_t>(node.meshIndex));
         }
-        entities[i] = entity;
+        nodeEntities[i] = entity;
+        entities.push_back(entity);
     }
     for (size_t i = 0; i < model->nodes.size(); ++i) {
-        if (model->nodes[i].parent >= 0) {
-            setParent(entities[i],
-                      entities[static_cast<size_t>(model->nodes[i].parent)]);
-        }
+        const int parent = model->nodes[i].parent;
+        setParent(nodeEntities[i],
+                  parent >= 0 ? nodeEntities[static_cast<size_t>(parent)]
+                              : root);
     }
     return entities;
 }
