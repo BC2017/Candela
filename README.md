@@ -72,6 +72,10 @@ Edit `shaders/fullscreen.slang` while the sandbox runs to see shader hot reload.
 
 ## Status
 
-**Phase 0 complete** — Vulkan 1.3 device bring-up (volk + vk-bootstrap + VMA), swapchain with frames-in-flight, dynamic rendering + synchronization2, fullscreen triangle via Slang shaders with hot reload (resilient to broken edits), validation-clean, Tracy client integrated.
+**Phase 1 complete** — render graph (declared attachments/reads → derived sync2 barriers, pooled transient images, dynamic rendering), bindless texture table (update-after-bind descriptor indexing), vertex pulling via buffer device address, glTF loading through fastgltf (Sponza: 103 draws, 26 mip-mapped textures), reverse-Z infinite projection, fly camera, shader-module cache with hot reload, Tracy GPU zones per pass. Sponza renders validation-clean at ~1,750 fps (debug, 1600×900, RTX 5080).
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 1 (render graph + bindless + glTF).
+Run `scripts\get-assets.ps1` once to download the Sponza test scene.
+
+Notes: textures load via stb_image for now — KTX2/BC compression moves into the Phase 3 asset import pipeline. Phase 0 history: Vulkan 1.3 bring-up, swapchain, Slang hot reload.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 2 (deferred PBR, IBL, shadows).

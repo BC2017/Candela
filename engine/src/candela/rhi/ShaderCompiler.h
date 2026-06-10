@@ -3,8 +3,10 @@
 #include "candela/rhi/VulkanCommon.h"
 
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace candela {
@@ -30,5 +32,36 @@ private:
 
 VkShaderModule createShaderModule(VkDevice device,
                                   const std::vector<uint32_t>& spirv);
+
+// Caches compiled shader modules keyed by (path, entry, stage). Modules with
+// identical SPIR-V are shared. get() recompiles when the source file's write
+// time changed; stale modules are destroyed once no key references them.
+class ShaderCache {
+public:
+    explicit ShaderCache(VkDevice device);
+    ~ShaderCache();
+
+    ShaderCache(const ShaderCache&) = delete;
+    ShaderCache& operator=(const ShaderCache&) = delete;
+
+    // Returns VK_NULL_HANDLE on compile failure (previous module stays cached,
+    // so callers can keep using their existing pipelines).
+    VkShaderModule get(const std::filesystem::path& sourcePath,
+                       const std::string& entry, ShaderStage stage);
+
+private:
+    struct Entry {
+        uint64_t spirvHash = 0;
+        VkShaderModule module = VK_NULL_HANDLE;
+        std::filesystem::file_time_type sourceTime;
+    };
+
+    void releaseModule(uint64_t hash);
+
+    VkDevice m_device;
+    ShaderCompiler m_compiler;
+    std::map<std::string, Entry> m_entries;          // key: path|entry|stage
+    std::map<uint64_t, std::pair<VkShaderModule, uint32_t>> m_modules; // hash → {module, refcount}
+};
 
 } // namespace candela

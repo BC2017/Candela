@@ -51,6 +51,46 @@ bool Window::shouldClose() const {
 
 void Window::pollEvents() {
     glfwPollEvents();
+
+    double x = 0.0;
+    double y = 0.0;
+    glfwGetCursorPos(m_window, &x, &y);
+    const glm::vec2 cursor{static_cast<float>(x), static_cast<float>(y)};
+    m_mouseDelta = cursor - m_lastCursorPos;
+    m_lastCursorPos = cursor;
+}
+
+bool Window::isKeyDown(int glfwKey) const {
+    return glfwGetKey(m_window, glfwKey) == GLFW_PRESS;
+}
+
+bool Window::isMouseButtonDown(int glfwButton) const {
+    return glfwGetMouseButton(m_window, glfwButton) == GLFW_PRESS;
+}
+
+glm::vec2 Window::consumeMouseDelta() {
+    const glm::vec2 delta = m_mouseDelta;
+    m_mouseDelta = {0.0f, 0.0f};
+    return delta;
+}
+
+void Window::setCursorCaptured(bool captured) {
+    if (captured == m_cursorCaptured) {
+        return;
+    }
+    m_cursorCaptured = captured;
+    glfwSetInputMode(m_window, GLFW_CURSOR,
+                     captured ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+    if (glfwRawMouseMotionSupported() == GLFW_TRUE) {
+        glfwSetInputMode(m_window, GLFW_RAW_MOUSE_MOTION,
+                         captured ? GLFW_TRUE : GLFW_FALSE);
+    }
+    // Swallow the cursor jump produced by the mode change.
+    double x = 0.0;
+    double y = 0.0;
+    glfwGetCursorPos(m_window, &x, &y);
+    m_lastCursorPos = {static_cast<float>(x), static_cast<float>(y)};
+    m_mouseDelta = {0.0f, 0.0f};
 }
 
 void Window::waitEvents() {

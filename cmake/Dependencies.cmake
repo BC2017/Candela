@@ -47,4 +47,18 @@ FetchContent_Declare(tracy
   GIT_TAG v0.11.1
   GIT_SHALLOW ON)
 
-FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy)
+FetchContent_Declare(fastgltf
+  GIT_REPOSITORY https://github.com/spnda/fastgltf.git
+  GIT_TAG v0.8.0
+  GIT_SHALLOW ON)
+
+FetchContent_Declare(stb
+  GIT_REPOSITORY https://github.com/nothings/stb.git
+  GIT_TAG master
+  GIT_SHALLOW ON)
+
+FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb)
+
+# stb has no CMake build — expose it as an interface include target.
+add_library(stb INTERFACE)
+target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})

@@ -60,6 +60,11 @@ Context::Context(Window& window) {
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.descriptorIndexing = VK_TRUE;
+    features12.runtimeDescriptorArray = VK_TRUE;
+    features12.descriptorBindingPartiallyBound = VK_TRUE;
+    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
+    features12.scalarBlockLayout = VK_TRUE;
 
     // Slang's SV_VertexID lowering declares the SPIR-V DrawParameters
     // capability; also needed later for gl_DrawID in GPU-driven rendering.
@@ -67,12 +72,16 @@ Context::Context(Window& window) {
     features11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     features11.shaderDrawParameters = VK_TRUE;
 
+    VkPhysicalDeviceFeatures features10{};
+    features10.samplerAnisotropy = VK_TRUE;
+
     auto physicalResult = vkb::PhysicalDeviceSelector{vkbInstance}
                               .set_surface(m_surface)
                               .set_minimum_version(1, 3)
                               .set_required_features_13(features13)
                               .set_required_features_12(features12)
                               .set_required_features_11(features11)
+                              .set_required_features(features10)
                               .select();
     CD_ASSERT(physicalResult.has_value(),
               "No GPU supports the required Vulkan 1.3 features: {}",
@@ -108,9 +117,56 @@ Context::Context(Window& window) {
     allocatorInfo.pVulkanFunctions = &vmaFunctions;
     allocatorInfo.vulkanApiVersion = VK_API_VERSION_1_3;
     VK_CHECK(vmaCreateAllocator(&allocatorInfo, &m_allocator));
+
+    VkCommandPoolCreateInfo poolInfo{};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = m_graphicsQueueFamily;
+    VK_CHECK(vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_immediatePool));
+
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.commandPool = m_immediatePool;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandBufferCount = 1;
+    VK_CHECK(vkAllocateCommandBuffers(m_device, &allocInfo, &m_immediateCmd));
+
+    VkFenceCreateInfo fenceInfo{};
+    fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    VK_CHECK(vkCreateFence(m_device, &fenceInfo, nullptr, &m_immediateFence));
+}
+
+void Context::immediateSubmit(
+    const std::function<void(VkCommandBuffer)>& record) const {
+    VK_CHECK(vkResetCommandBuffer(m_immediateCmd, 0));
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(m_immediateCmd, &beginInfo));
+
+    record(m_immediateCmd);
+
+    VK_CHECK(vkEndCommandBuffer(m_immediateCmd));
+
+    VkCommandBufferSubmitInfo cmdInfo{};
+    cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;
+    cmdInfo.commandBuffer = m_immediateCmd;
+
+    VkSubmitInfo2 submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+    submitInfo.commandBufferInfoCount = 1;
+    submitInfo.pCommandBufferInfos = &cmdInfo;
+    VK_CHECK(vkQueueSubmit2(m_graphicsQueue, 1, &submitInfo, m_immediateFence));
+
+    VK_CHECK(vkWaitForFences(m_device, 1, &m_immediateFence, VK_TRUE,
+                             UINT64_MAX));
+    VK_CHECK(vkResetFences(m_device, 1, &m_immediateFence));
 }
 
 Context::~Context() {
+    vkDestroyFence(m_device, m_immediateFence, nullptr);
+    vkDestroyCommandPool(m_device, m_immediatePool, nullptr);
     vmaDestroyAllocator(m_allocator);
     vkDestroyDevice(m_device, nullptr);
     vkDestroySurfaceKHR(m_instance, m_surface, nullptr);

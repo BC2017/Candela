@@ -1,7 +1,10 @@
 build/
 out/
+# Test content downloaded by scripts/get-assets.ps1 — not committed.
+assets/
 .vs/
 .vscode/
+.idea/
 .cache/
 *.user
 imgui.ini

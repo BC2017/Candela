@@ -1,11 +1,13 @@
 #pragma once
 
+#include "candela/core/Compiler.h"
 #include "candela/rhi/VulkanCommon.h"
 
-#pragma warning(push, 0)
+CD_PUSH_DISABLE_WARNINGS
 #include <vk_mem_alloc.h>
-#pragma warning(pop)
+CD_POP_WARNINGS
 
+#include <functional>
 #include <string>
 
 namespace candela {
@@ -33,6 +35,14 @@ public:
 
     void waitIdle() const;
 
+    // Records, submits, and waits on the graphics queue. For uploads and
+    // one-off GPU work; not for per-frame use.
+    void immediateSubmit(const std::function<void(VkCommandBuffer)>& record) const;
+
+    // Command buffer backing immediateSubmit; in the initial state between
+    // calls (Tracy's GPU context init wants exactly that).
+    VkCommandBuffer immediateCommandBuffer() const { return m_immediateCmd; }
+
 private:
     VkInstance m_instance = VK_NULL_HANDLE;
     VkDebugUtilsMessengerEXT m_debugMessenger = VK_NULL_HANDLE;
@@ -42,6 +52,9 @@ private:
     VkQueue m_graphicsQueue = VK_NULL_HANDLE;
     uint32_t m_graphicsQueueFamily = 0;
     VmaAllocator m_allocator = VK_NULL_HANDLE;
+    VkCommandPool m_immediatePool = VK_NULL_HANDLE;
+    VkCommandBuffer m_immediateCmd = VK_NULL_HANDLE;
+    VkFence m_immediateFence = VK_NULL_HANDLE;
     std::string m_gpuName;
 };
 
