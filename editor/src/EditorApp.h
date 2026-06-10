@@ -42,6 +42,8 @@ public:
 private:
     void drawMenuBar(World& world);
     void drawViewport(World& world);
+    void drawLightGizmos(World& world, const glm::vec2& imagePos,
+                         const glm::vec2& imageSize);
     void drawHierarchy(World& world);
     void drawEntityNode(World& world, entt::entity entity);
     void drawInspector(World& world);
@@ -92,6 +94,7 @@ private:
 
     DebugView m_debugView = DebugView::Final;
     float m_orbitDistance = 5.0f;
+    bool m_showLightGizmos = true;
 };
 
 } // namespace candela::editor

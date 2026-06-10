@@ -241,6 +241,8 @@ void EditorApp::drawMenuBar(World& world) {
                 m_debugView = static_cast<DebugView>(i);
             }
         }
+        ImGui::Separator();
+        ImGui::MenuItem("Light Gizmos", nullptr, &m_showLightGizmos);
         ImGui::EndMenu();
     }
     if (m_playing ? ImGui::MenuItem("[ Stop ]") : ImGui::MenuItem("[ Play ]")) {
@@ -348,6 +350,8 @@ void EditorApp::drawViewport(World& world) {
         }
     }
 
+    drawLightGizmos(world, {imagePos.x, imagePos.y}, {avail.x, avail.y});
+
     // Click picking (when the gizmo isn't involved).
     if (m_viewportHovered && !gizmoActive && !ImGui::GetIO().KeyAlt &&
         ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -369,6 +373,118 @@ void EditorApp::drawViewport(World& world) {
 
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+void EditorApp::drawLightGizmos(World& world, const glm::vec2& imagePos,
+                                const glm::vec2& imageSize) {
+    if (!m_showLightGizmos || m_playing || imageSize.x < 1.0f ||
+        imageSize.y < 1.0f) {
+        return;
+    }
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->PushClipRect(
+        ImVec2(imagePos.x, imagePos.y),
+        ImVec2(imagePos.x + imageSize.x, imagePos.y + imageSize.y), true);
+
+    const float aspect = imageSize.x / imageSize.y;
+    const glm::mat4 viewProjection = m_camera.viewProjection(aspect);
+
+    // World → viewport pixels under the negative-viewport convention
+    // (matches ndcToUV in the shaders). False when behind the camera.
+    auto project = [&](const glm::vec3& world_, ImVec2& out) {
+        const glm::vec4 clip = viewProjection * glm::vec4(world_, 1.0f);
+        if (clip.w < 1e-4f) {
+            return false;
+        }
+        const glm::vec2 ndc = glm::vec2(clip) / clip.w;
+        out = ImVec2(imagePos.x + (ndc.x * 0.5f + 0.5f) * imageSize.x,
+                     imagePos.y + (0.5f - ndc.y * 0.5f) * imageSize.y);
+        return true;
+    };
+    auto line = [&](const glm::vec3& a, const glm::vec3& b, ImU32 color,
+                    float thickness) {
+        ImVec2 screenA;
+        ImVec2 screenB;
+        if (project(a, screenA) && project(b, screenB)) {
+            drawList->AddLine(screenA, screenB, color, thickness);
+        }
+    };
+
+    // Point lights: a wireframe sphere showing position and falloff radius.
+    // (Point lights are omnidirectional — direction arrows belong to the sun.)
+    constexpr int kSegments = 40;
+    constexpr float kTau = 6.28318530f;
+    static const glm::vec3 kCircleBases[3][2] = {
+        {{1.0f, 0.0f, 0.0f}, {0.0f, 1.0f, 0.0f}},
+        {{1.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},
+        {{0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 1.0f}},
+    };
+    for (auto [entity, transform, light] :
+         world.registry.view<WorldTransform, PointLightComponent>().each()) {
+        const glm::vec3 center = glm::vec3(transform.value[3]);
+        const bool isSelected = editorIdOf(world, entity) == m_selected;
+        const float alpha = isSelected ? 0.95f : 0.4f;
+        const ImU32 color = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(light.color.r, light.color.g, light.color.b, alpha));
+        const float thickness = isSelected ? 2.0f : 1.2f;
+
+        for (const auto& basis : kCircleBases) {
+            glm::vec3 previous = center + basis[0] * light.radius;
+            for (int i = 1; i <= kSegments; ++i) {
+                const float angle = kTau * static_cast<float>(i) / kSegments;
+                const glm::vec3 point =
+                    center + (basis[0] * std::cos(angle) +
+                              basis[1] * std::sin(angle)) *
+                                 light.radius;
+                line(previous, point, color, thickness);
+                previous = point;
+            }
+        }
+
+        ImVec2 screenCenter;
+        if (project(center, screenCenter)) {
+            const ImU32 solid = ImGui::ColorConvertFloat4ToU32(
+                ImVec4(light.color.r, light.color.g, light.color.b, 1.0f));
+            drawList->AddCircleFilled(screenCenter, isSelected ? 5.0f : 3.5f,
+                                      solid);
+            drawList->AddCircle(screenCenter, isSelected ? 7.0f : 5.0f,
+                                IM_COL32(255, 255, 255, 160));
+        }
+    }
+
+    // Sun: a direction arrow anchored above the world origin, pointing the
+    // way the light travels.
+    {
+        const SceneSettings& settings = world.settings;
+        const glm::vec3 direction = -glm::normalize(settings.toSun); // travel
+        const glm::vec3 tip{0.0f, 1.5f, 0.0f};
+        const glm::vec3 tail = tip - direction * 3.0f;
+        const ImU32 color = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(settings.sunColor.r, settings.sunColor.g,
+                   settings.sunColor.b, 0.9f));
+
+        line(tail, tip, color, 2.5f);
+        // Arrowhead: four fins offset perpendicular to the shaft.
+        const glm::vec3 up = std::abs(direction.y) > 0.95f
+                                 ? glm::vec3(1.0f, 0.0f, 0.0f)
+                                 : glm::vec3(0.0f, 1.0f, 0.0f);
+        const glm::vec3 side = glm::normalize(glm::cross(direction, up));
+        const glm::vec3 side2 = glm::normalize(glm::cross(direction, side));
+        const glm::vec3 back = tip - direction * 0.5f;
+        for (const glm::vec3& fin :
+             {side * 0.18f, side * -0.18f, side2 * 0.18f, side2 * -0.18f}) {
+            line(tip, back + fin, color, 2.0f);
+        }
+        // A small sun disc at the tail.
+        ImVec2 screenTail;
+        if (project(tail, screenTail)) {
+            drawList->AddCircle(screenTail, 8.0f, color, 0, 2.0f);
+            drawList->AddCircleFilled(screenTail, 3.0f, color);
+        }
+    }
+
+    drawList->PopClipRect();
 }
 
 void EditorApp::drawEntityNode(World& world, entt::entity entity) {
