@@ -374,8 +374,20 @@ void EditorApp::drawViewport(World& world) {
         if (*picked == 0) {
             m_selected = 0;
         } else {
-            const auto entity = static_cast<entt::entity>(*picked - 1);
+            auto entity = static_cast<entt::entity>(*picked - 1);
             if (world.registry.valid(entity)) {
+                // Viewport clicks select the whole group: walk up to the
+                // topmost ancestor so model instances move as one object.
+                // Individual children remain selectable in the Hierarchy.
+                while (true) {
+                    const auto* parent =
+                        world.registry.try_get<Parent>(entity);
+                    if (parent == nullptr ||
+                        !world.registry.valid(parent->value)) {
+                        break;
+                    }
+                    entity = parent->value;
+                }
                 m_selected = editorIdOf(world, entity);
             }
         }
