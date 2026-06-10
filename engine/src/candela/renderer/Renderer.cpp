@@ -47,7 +47,7 @@ struct GBufferPush {
     uint32_t flags;
     float metallicFactor;
     float roughnessFactor;
-    float pad;
+    uint32_t entityId; // entt id + 1; 0 = no entity (picking)
     glm::vec4 baseColorFactor;
 };
 static_assert(sizeof(GBufferPush) == 128, "GBufferPush must fit push budget");
@@ -70,6 +70,7 @@ struct LightingPush {
     glm::vec2 invResolution;
     float iblIntensity;
     uint32_t prefilteredMips;
+    uint32_t debugView;
 };
 
 struct BloomPush {
@@ -141,6 +142,18 @@ Renderer::Renderer(Window& window) : m_window(window) {
     CD_ASSERT(std::filesystem::exists(m_shaderDir), "Shader dir not found: {}",
               m_shaderDir.string());
 
+    // Pick readback buffer (one pixel of the entity-ID target).
+    m_pickBuffer = createBuffer(*m_context, sizeof(uint32_t),
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                    VMA_ALLOCATION_CREATE_MAPPED_BIT);
+    {
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(m_context->allocator(), m_pickBuffer.allocation,
+                             &info);
+        m_pickMapped = info.pMappedData;
+    }
+
     // Shadow cascade array.
     m_shadowMap = createImage2D(*m_context, kDepthFormat,
                                 {kShadowMapSize, kShadowMapSize},
@@ -183,6 +196,8 @@ Renderer::Renderer(Window& window) : m_window(window) {
 Renderer::~Renderer() {
     m_context->waitIdle();
 
+    destroyBuffer(*m_context, m_pickBuffer);
+    destroyImage(*m_context, m_viewportImage);
     m_ibl.destroy(*m_context);
     for (VkImageView view : m_shadowLayerViews) {
         if (view != VK_NULL_HANDLE) {
@@ -423,7 +438,7 @@ bool Renderer::createPipelines() {
     gbuffer.shaderFile = "gbuffer.slang";
     gbuffer.fsEntry = "fsMain";
     gbuffer.colorFormats = {VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_R16G16_UNORM,
-                            VK_FORMAT_R8G8B8A8_UNORM};
+                            VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R32_UINT};
     gbuffer.depthFormat = kDepthFormat;
     gbuffer.depthTest = true;
     gbuffer.depthWrite = true;
@@ -483,6 +498,27 @@ bool Renderer::createPipelines() {
         *slots[i] = newPipelines[i];
     }
     return true;
+}
+
+void Renderer::ensureViewportImage(VkExtent2D extent) {
+    if (m_viewportImage.image != VK_NULL_HANDLE &&
+        m_viewportImage.extent.width == extent.width &&
+        m_viewportImage.extent.height == extent.height) {
+        return;
+    }
+    m_context->waitIdle();
+    destroyImage(*m_context, m_viewportImage);
+    m_viewportImage = createImage2D(*m_context, m_swapchain->format(), extent,
+                                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_SAMPLED_BIT);
+    m_viewportEverRendered = false;
+    ++m_viewportGeneration;
+}
+
+std::optional<uint32_t> Renderer::takePickResult() {
+    auto result = m_pickResult;
+    m_pickResult.reset();
+    return result;
 }
 
 void Renderer::recreateSwapchain() {
@@ -567,11 +603,14 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
 }
 
 void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
-                              const Camera& camera, const World& world) {
+                              const Camera& camera, const World& world,
+                              const RenderOptions& options) {
     ZoneScoped;
 
     FrameData& frame = m_frames[m_frameIndex];
-    const VkExtent2D extent = m_swapchain->extent();
+    const VkExtent2D swapExtent = m_swapchain->extent();
+    const bool editorMode = options.viewportExtent.width != 0;
+    const VkExtent2D extent = editorMode ? options.viewportExtent : swapExtent;
     const float aspect = static_cast<float>(extent.width) /
                          static_cast<float>(extent.height);
     const VkDeviceAddress frameAddress = frame.constants.deviceAddress;
@@ -591,8 +630,22 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
 
     const RenderGraph::Handle backbuffer = graph.importImage(
         "backbuffer", m_swapchain->image(imageIndex),
-        m_swapchain->view(imageIndex), m_swapchain->format(), extent,
+        m_swapchain->view(imageIndex), m_swapchain->format(), swapExtent,
         VK_IMAGE_LAYOUT_UNDEFINED);
+
+    // The tonemapped scene lands either on the backbuffer (runtime) or the
+    // persistent offscreen viewport image the editor shows via ImGui.
+    RenderGraph::Handle sceneTarget = backbuffer;
+    if (editorMode) {
+        sceneTarget = graph.importImage(
+            "viewport", m_viewportImage.image, m_viewportImage.view,
+            m_viewportImage.format, extent,
+            m_viewportEverRendered ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                   : VK_IMAGE_LAYOUT_UNDEFINED,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        m_viewportEverRendered = true;
+    }
     const RenderGraph::Handle shadowMap = graph.importImage(
         "shadow-cascades", m_shadowMap.image, m_shadowMap.view, kDepthFormat,
         {kShadowMapSize, kShadowMapSize},
@@ -611,6 +664,10 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     const RenderGraph::Handle gbMaterial = graph.createImage(
         "gb-material", VK_FORMAT_R8G8B8A8_UNORM, extent,
         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+    const RenderGraph::Handle gbEntityId = graph.createImage(
+        "gb-entity-id", VK_FORMAT_R32_UINT, extent,
+        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     const RenderGraph::Handle depth = graph.createImage(
         "depth", kDepthFormat, extent,
         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
@@ -664,6 +721,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             {gbAlbedo, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbNormal, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
             {gbMaterial, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
+            {gbEntityId, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}},
         };
         RenderGraph::Attachment depthAttachment;
         depthAttachment.handle = depth;
@@ -690,6 +748,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 push.flags = primitive.flags;
                 push.metallicFactor = primitive.metallicFactor;
                 push.roughnessFactor = primitive.roughnessFactor;
+                push.entityId = draw.entityId;
                 push.baseColorFactor = primitive.baseColorFactor;
                 vkCmdPushConstants(passCmd, m_pipelineLayout,
                                    VK_SHADER_STAGE_VERTEX_BIT |
@@ -724,6 +783,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                               1.0f / static_cast<float>(extent.height)};
         push.iblIntensity = world.settings.iblIntensity;
         push.prefilteredMips = IBL::kPrefilteredMips;
+        push.debugView = static_cast<uint32_t>(options.debugView);
         pass.execute = [this, extent, push](VkCommandBuffer passCmd) {
             setFullViewport(passCmd, extent);
             vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -832,11 +892,11 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         }
     }
 
-    // --- Tonemap to backbuffer ---
+    // --- Tonemap to the scene target ---
     {
         RenderGraph::Pass pass;
         pass.name = "tonemap";
-        pass.colorAttachments = {{backbuffer,
+        pass.colorAttachments = {{sceneTarget,
                                   VK_ATTACHMENT_LOAD_OP_DONT_CARE,
                                   {},
                                   VK_NULL_HANDLE,
@@ -865,8 +925,74 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         graph.addPass(std::move(pass));
     }
 
+    // --- Editor UI to the backbuffer (samples the viewport image) ---
+    if (editorMode && options.recordUI) {
+        RenderGraph::Pass pass;
+        pass.name = "editor-ui";
+        pass.colorAttachments = {{backbuffer,
+                                  VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                  {.color = {{0.06f, 0.06f, 0.07f, 1.0f}}},
+                                  VK_NULL_HANDLE,
+                                  {}}};
+        pass.sampledImages = {sceneTarget};
+        pass.execute = [swapExtent, &options](VkCommandBuffer passCmd) {
+            // ImGui supplies its own projection; default (positive) viewport
+            // orientation, unlike the scene's negative-height convention.
+            VkViewport viewport{};
+            viewport.width = static_cast<float>(swapExtent.width);
+            viewport.height = static_cast<float>(swapExtent.height);
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(passCmd, 0, 1, &viewport);
+            VkRect2D scissor{{0, 0}, swapExtent};
+            vkCmdSetScissor(passCmd, 0, 1, &scissor);
+            options.recordUI(passCmd);
+        };
+        graph.addPass(std::move(pass));
+    }
+
     graph.setFinalLayout(backbuffer, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     graph.execute(cmd, m_tracyCtx);
+
+    // --- Pick readback: one texel of the entity-ID target ---
+    if (options.pickPixel.has_value()) {
+        const int32_t x = std::clamp(options.pickPixel->x, 0,
+                                     static_cast<int32_t>(extent.width) - 1);
+        const int32_t y = std::clamp(options.pickPixel->y, 0,
+                                     static_cast<int32_t>(extent.height) - 1);
+
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = graph.image(gbEntityId);
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        VkDependencyInfo dependency{};
+        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependency.imageMemoryBarrierCount = 1;
+        dependency.pImageMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageOffset = {x, y, 0};
+        region.imageExtent = {1, 1, 1};
+        vkCmdCopyImageToBuffer(cmd, graph.image(gbEntityId),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               m_pickBuffer.buffer, 1, &region);
+        // Transient image contents are discarded next frame; layout left as
+        // TRANSFER_SRC is fine (pool re-imports as UNDEFINED).
+        m_pickPending = true;
+        m_pickFrameSlot = m_frameIndex;
+    }
 
 #ifdef TRACY_ENABLE
     if (m_tracyCtx != nullptr) {
@@ -878,7 +1004,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
 }
 
 void Renderer::drawFrame(const Camera& camera, World& world,
-                         AssetRegistry& assets) {
+                         AssetRegistry& assets, const RenderOptions& options) {
     ZoneScoped;
 
     checkShaderHotReload();
@@ -891,6 +1017,13 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         recreateSwapchain();
     }
 
+    const bool editorMode = options.viewportExtent.width != 0;
+    if (editorMode) {
+        ensureViewportImage(options.viewportExtent);
+    }
+    const VkExtent2D sceneExtent =
+        editorMode ? options.viewportExtent : m_swapchain->extent();
+
     // Assemble this frame's draws and lights from the ECS. Models still
     // importing simply contribute nothing yet.
     m_frameDraws.clear();
@@ -901,9 +1034,10 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         if (model == nullptr || mesh.meshIndex >= model->meshes.size()) {
             continue;
         }
+        const uint32_t entityId = static_cast<uint32_t>(entity) + 1;
         for (const GpuPrimitive& primitive :
              model->meshes[mesh.meshIndex].primitives) {
-            m_frameDraws.push_back({transform.value, &primitive});
+            m_frameDraws.push_back({transform.value, &primitive, entityId});
         }
     }
     for (auto [entity, transform, light] :
@@ -918,6 +1052,12 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     VK_CHECK(vkWaitForFences(device, 1, &frame.inFlightFence, VK_TRUE,
                              UINT64_MAX));
 
+    // The pick recorded in this frame slot has now fully executed.
+    if (m_pickPending && m_pickFrameSlot == m_frameIndex) {
+        m_pickResult = *static_cast<const uint32_t*>(m_pickMapped);
+        m_pickPending = false;
+    }
+
     uint32_t imageIndex = 0;
     const VkResult acquireResult =
         vkAcquireNextImageKHR(device, m_swapchain->handle(), UINT64_MAX,
@@ -930,15 +1070,14 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     CD_ASSERT(acquireResult == VK_SUCCESS || acquireResult == VK_SUBOPTIMAL_KHR,
               "vkAcquireNextImageKHR failed: {}", string_VkResult(acquireResult));
 
-    const VkExtent2D extent = m_swapchain->extent();
     updateFrameConstants(frame, camera, world,
-                         static_cast<float>(extent.width) /
-                             static_cast<float>(extent.height));
+                         static_cast<float>(sceneExtent.width) /
+                             static_cast<float>(sceneExtent.height));
 
     VK_CHECK(vkResetFences(device, 1, &frame.inFlightFence));
     VK_CHECK(vkResetCommandPool(device, frame.pool, 0));
 
-    recordCommands(frame.cmd, imageIndex, camera, world);
+    recordCommands(frame.cmd, imageIndex, camera, world, options);
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;

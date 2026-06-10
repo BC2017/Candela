@@ -17,7 +17,7 @@ struct GBufferPush
     uint flags;              // 100
     float metallicFactor;    // 104
     float roughnessFactor;   // 108
-    float pad;               // 112
+    uint entityId;           // 112 (entt id + 1; 0 = none, for picking)
     float4 baseColorFactor;  // 128
 };
 
@@ -54,6 +54,7 @@ struct GBufferOut
     float4 albedo : SV_Target0;
     float2 normal : SV_Target1;
     float4 material : SV_Target2;
+    uint entityId : SV_Target3;
 };
 
 [shader("fragment")]
@@ -88,5 +89,6 @@ GBufferOut fsMain(VSOut input)
     output.albedo = float4(baseColor.rgb, 1.0);
     output.normal = encodeOctahedral(normal);
     output.material = float4(metallic, roughness, occlusion, 0.0);
+    output.entityId = gPush.entityId;
     return output;
 }

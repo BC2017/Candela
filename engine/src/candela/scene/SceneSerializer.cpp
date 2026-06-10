@@ -32,7 +32,9 @@ glm::quat quatFromJson(const nlohmann::json& j) {
 
 } // namespace
 
-bool save(const World& world, const std::filesystem::path& path) {
+namespace {
+
+nlohmann::json worldToJson(const World& world) {
     const auto& registry = world.registry;
     nlohmann::json scene;
     scene["version"] = 1;
@@ -90,31 +92,11 @@ bool save(const World& world, const std::filesystem::path& path) {
         entityArray.push_back(e);
     }
     scene["entities"] = entityArray;
-
-    std::ofstream file(path);
-    if (!file) {
-        CD_ERROR("Failed to open scene for writing: {}", path.string());
-        return false;
-    }
-    file << scene.dump(2) << '\n';
-    CD_INFO("Saved scene: {} ({} entities)", path.string(), entities.size());
-    return true;
+    return scene;
 }
 
-bool load(World& world, AssetRegistry& assets,
-          const std::filesystem::path& path) {
-    std::ifstream file(path);
-    if (!file) {
-        CD_ERROR("Failed to open scene: {}", path.string());
-        return false;
-    }
-    nlohmann::json scene =
-        nlohmann::json::parse(file, nullptr, /*allow_exceptions=*/false);
-    if (scene.is_discarded()) {
-        CD_ERROR("Scene is not valid JSON: {}", path.string());
-        return false;
-    }
-
+void worldFromJson(World& world, AssetRegistry& assets,
+                   const nlohmann::json& scene) {
     world.registry.clear();
     world.settings = {};
 
@@ -168,8 +150,54 @@ bool load(World& world, AssetRegistry& assets,
         }
         ++index;
     }
+}
 
-    CD_INFO("Loaded scene: {} ({} entities)", path.string(), entities.size());
+} // namespace
+
+bool save(const World& world, const std::filesystem::path& path) {
+    std::ofstream file(path);
+    if (!file) {
+        CD_ERROR("Failed to open scene for writing: {}", path.string());
+        return false;
+    }
+    file << worldToJson(world).dump(2) << '\n';
+    const auto* names = world.registry.storage<Name>();
+    CD_INFO("Saved scene: {} ({} entities)", path.string(),
+            names != nullptr ? names->size() : 0);
+    return true;
+}
+
+bool load(World& world, AssetRegistry& assets,
+          const std::filesystem::path& path) {
+    std::ifstream file(path);
+    if (!file) {
+        CD_ERROR("Failed to open scene: {}", path.string());
+        return false;
+    }
+    nlohmann::json scene =
+        nlohmann::json::parse(file, nullptr, /*allow_exceptions=*/false);
+    if (scene.is_discarded()) {
+        CD_ERROR("Scene is not valid JSON: {}", path.string());
+        return false;
+    }
+    worldFromJson(world, assets, scene);
+    CD_INFO("Loaded scene: {} ({} entities)", path.string(),
+            world.registry.storage<Name>().size());
+    return true;
+}
+
+std::string saveToString(const World& world) {
+    return worldToJson(world).dump(2);
+}
+
+bool loadFromString(World& world, AssetRegistry& assets,
+                    const std::string& text) {
+    nlohmann::json scene =
+        nlohmann::json::parse(text, nullptr, /*allow_exceptions=*/false);
+    if (scene.is_discarded()) {
+        return false;
+    }
+    worldFromJson(world, assets, scene);
     return true;
 }
 
