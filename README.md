@@ -72,10 +72,11 @@ Edit `shaders/fullscreen.slang` while the sandbox runs to see shader hot reload.
 
 ## Status
 
-**Phase 1 complete** — render graph (declared attachments/reads → derived sync2 barriers, pooled transient images, dynamic rendering), bindless texture table (update-after-bind descriptor indexing), vertex pulling via buffer device address, glTF loading through fastgltf (Sponza: 103 draws, 26 mip-mapped textures), reverse-Z infinite projection, fly camera, shader-module cache with hot reload, Tracy GPU zones per pass. Sponza renders validation-clean at ~1,750 fps (debug, 1600×900, RTX 5080).
+**Phase 2 complete** — deferred PBR pipeline, fully render-graph driven:
+4 shadow cascades (texel-snapped, PCF) → G-buffer (albedo / octahedral normals / metallic-roughness-AO) → Cook-Torrance GGX lighting with sun + point lights and split-sum IBL (GPU-precomputed irradiance, GGX-prefiltered specular, BRDF LUT from a Poly Haven HDRI) → dual-Kawase bloom → ACES tonemap. Full glTF material loading: normal mapping with tangents, metallic-roughness, occlusion, sRGB-aware texture cache. Sponza renders validation-clean at ~550 fps (debug, 1600×900, RTX 5080); all shaders hot-reload as a group.
 
-Run `scripts\get-assets.ps1` once to download the Sponza test scene.
+Run `scripts\get-assets.ps1` once to download the Sponza test scene and HDRI.
 
-Notes: textures load via stb_image for now — KTX2/BC compression moves into the Phase 3 asset import pipeline. Phase 0 history: Vulkan 1.3 bring-up, swapchain, Slang hot reload.
+Deferred to later phases: emissive + velocity G-buffer targets (TAA/denoising), sky rendering from the environment cube, alpha-tested shadows, IBL disk caching, KTX2/BC texture compression (Phase 3 asset pipeline). Phase 1: render graph, bindless, glTF. Phase 0: Vulkan bring-up, Slang hot reload.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 2 (deferred PBR, IBL, shadows).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 3 (ECS, asset system, scene serialization).

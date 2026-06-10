@@ -32,7 +32,7 @@ namespace {
 // Returns UINT32_MAX on failure.
 uint32_t loadTexture(Context& context, Bindless& bindless, Scene& scene,
                      const fastgltf::Asset& asset, const fastgltf::Image& image,
-                     const std::filesystem::path& baseDir) {
+                     const std::filesystem::path& baseDir, bool srgb) {
     ZoneScoped;
 
     int width = 0;
@@ -66,11 +66,12 @@ uint32_t loadTexture(Context& context, Bindless& bindless, Scene& scene,
 
     GpuImage texture = createTexture2D(context, pixels,
                                        static_cast<uint32_t>(width),
-                                       static_cast<uint32_t>(height),
-                                       /*srgb=*/true);
+                                       static_cast<uint32_t>(height), srgb);
     stbi_image_free(pixels);
 
-    const uint32_t index = bindless.add(texture.view, bindless.defaultSampler());
+    const uint32_t index = bindless.add(Bindless::Kind::Texture2D,
+                                        texture.view,
+                                        bindless.defaultSampler());
     scene.textures.push_back(texture);
     return index;
 }
@@ -99,28 +100,28 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
     // materials and failed loads.
     const uint32_t whitePixel = 0xFFFFFFFFu;
     GpuImage whiteTexture = createTexture2D(context, &whitePixel, 1, 1, true);
-    const uint32_t whiteIndex =
-        bindless.add(whiteTexture.view, bindless.defaultSampler());
+    const uint32_t whiteIndex = bindless.add(
+        Bindless::Kind::Texture2D, whiteTexture.view, bindless.defaultSampler());
     scene.textures.push_back(whiteTexture);
 
-    // Lazily load base-color textures (Sponza ships normal/metallic maps too;
-    // those wait for Phase 2's material model).
-    std::unordered_map<size_t, uint32_t> imageToBindless;
-    auto textureFor = [&](size_t gltfTextureIndex) -> uint32_t {
+    // Texture cache keyed by (glTF image, color space) — the same image may
+    // legitimately be referenced as both (rare, but cheap to support).
+    std::unordered_map<uint64_t, uint32_t> imageToBindless;
+    auto textureFor = [&](size_t gltfTextureIndex, bool srgb) -> uint32_t {
         const auto& texture = asset.textures[gltfTextureIndex];
         if (!texture.imageIndex) {
             return whiteIndex;
         }
         const size_t imageIndex = *texture.imageIndex;
-        if (auto it = imageToBindless.find(imageIndex);
-            it != imageToBindless.end()) {
+        const uint64_t key = (imageIndex << 1) | (srgb ? 1u : 0u);
+        if (auto it = imageToBindless.find(key); it != imageToBindless.end()) {
             return it->second;
         }
         const uint32_t loaded_ = loadTexture(context, bindless, scene, asset,
                                              asset.images[imageIndex],
-                                             path.parent_path());
+                                             path.parent_path(), srgb);
         const uint32_t index = loaded_ == UINT32_MAX ? whiteIndex : loaded_;
-        imageToBindless.emplace(imageIndex, index);
+        imageToBindless.emplace(key, index);
         return index;
     };
 
@@ -130,8 +131,13 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
         VkBuffer indexBuffer;
         uint32_t indexCount;
         VkDeviceAddress vertexAddress;
-        uint32_t textureIndex;
+        uint32_t albedoTexture;
+        uint32_t normalTexture;
+        uint32_t metallicRoughnessTexture;
+        uint32_t occlusionTexture;
         uint32_t flags;
+        float metallicFactor;
+        float roughnessFactor;
         glm::vec4 baseColorFactor;
     };
     std::unordered_map<const fastgltf::Primitive*, GpuPrimitive> gpuPrimitives;
@@ -155,6 +161,7 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
             asset, positionAccessor, [&](glm::vec3 value, size_t index) {
                 vertices[index].position = value;
                 vertices[index].normal = {0.0f, 1.0f, 0.0f};
+                vertices[index].tangent = {1.0f, 0.0f, 0.0f, 1.0f};
             });
 
         if (const auto* normalAttr = primitive.findAttribute("NORMAL");
@@ -171,6 +178,16 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
                 asset, asset.accessors[uvAttr->accessorIndex],
                 [&](glm::vec2 value, size_t index) {
                     vertices[index].uv = value;
+                });
+        }
+        bool hasTangents = false;
+        if (const auto* tangentAttr = primitive.findAttribute("TANGENT");
+            tangentAttr != primitive.attributes.end()) {
+            hasTangents = true;
+            fastgltf::iterateAccessorWithIndex<glm::vec4>(
+                asset, asset.accessors[tangentAttr->accessorIndex],
+                [&](glm::vec4 value, size_t index) {
+                    vertices[index].tangent = value;
                 });
         }
 
@@ -198,16 +215,39 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
         gpu.indexBuffer = indexBuffer.buffer;
         gpu.indexCount = static_cast<uint32_t>(indices.size());
         gpu.vertexAddress = vertexBuffer.deviceAddress;
-        gpu.textureIndex = whiteIndex;
+        gpu.albedoTexture = whiteIndex;
+        gpu.normalTexture = whiteIndex;
+        gpu.metallicRoughnessTexture = whiteIndex;
+        gpu.occlusionTexture = whiteIndex;
+        gpu.metallicFactor = 0.0f;
+        gpu.roughnessFactor = 1.0f;
         gpu.baseColorFactor = glm::vec4(1.0f);
 
         if (primitive.materialIndex) {
             const auto& material = asset.materials[*primitive.materialIndex];
-            const auto& factor = material.pbrData.baseColorFactor;
-            gpu.baseColorFactor = {factor[0], factor[1], factor[2], factor[3]};
-            if (material.pbrData.baseColorTexture) {
-                gpu.textureIndex =
-                    textureFor(material.pbrData.baseColorTexture->textureIndex);
+            const auto& pbr = material.pbrData;
+            gpu.baseColorFactor = {pbr.baseColorFactor[0],
+                                   pbr.baseColorFactor[1],
+                                   pbr.baseColorFactor[2],
+                                   pbr.baseColorFactor[3]};
+            gpu.metallicFactor = pbr.metallicFactor;
+            gpu.roughnessFactor = pbr.roughnessFactor;
+            if (pbr.baseColorTexture) {
+                gpu.albedoTexture =
+                    textureFor(pbr.baseColorTexture->textureIndex, true);
+            }
+            if (pbr.metallicRoughnessTexture) {
+                gpu.metallicRoughnessTexture = textureFor(
+                    pbr.metallicRoughnessTexture->textureIndex, false);
+            }
+            if (material.normalTexture && hasTangents) {
+                gpu.normalTexture =
+                    textureFor(material.normalTexture->textureIndex, false);
+                gpu.flags |= DrawFlags::kHasNormalMap;
+            }
+            if (material.occlusionTexture) {
+                gpu.occlusionTexture =
+                    textureFor(material.occlusionTexture->textureIndex, false);
             }
             if (material.alphaMode == fastgltf::AlphaMode::Mask) {
                 gpu.flags |= DrawFlags::kAlphaMask;
@@ -246,8 +286,13 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
                 draw.indexBuffer = gpu->indexBuffer;
                 draw.indexCount = gpu->indexCount;
                 draw.vertexAddress = gpu->vertexAddress;
-                draw.textureIndex = gpu->textureIndex;
+                draw.albedoTexture = gpu->albedoTexture;
+                draw.normalTexture = gpu->normalTexture;
+                draw.metallicRoughnessTexture = gpu->metallicRoughnessTexture;
+                draw.occlusionTexture = gpu->occlusionTexture;
                 draw.flags = gpu->flags;
+                draw.metallicFactor = gpu->metallicFactor;
+                draw.roughnessFactor = gpu->roughnessFactor;
                 draw.baseColorFactor = gpu->baseColorFactor;
                 scene.draws.push_back(draw);
             }

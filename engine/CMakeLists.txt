@@ -9,6 +9,8 @@ add_library(candela STATIC
     src/candela/rhi/Swapchain.cpp
     src/candela/rhi/VmaUsage.cpp
     src/candela/renderer/Camera.cpp
+    src/candela/renderer/Cascades.cpp
+    src/candela/renderer/IBL.cpp
     src/candela/renderer/Renderer.cpp
     src/candela/scene/GltfScene.cpp
     src/candela/scene/StbUsage.cpp

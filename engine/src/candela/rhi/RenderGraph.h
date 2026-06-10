@@ -32,10 +32,17 @@ public:
 
     void begin();
 
-    // Wraps an externally owned image (e.g. the swapchain backbuffer).
+    // Wraps an externally owned image (e.g. the swapchain backbuffer, or a
+    // persistent shadow map). For images used by previous frames, pass the
+    // stage/access of that prior use so the first barrier synchronizes
+    // against it (frames in flight overlap on the queue).
     Handle importImage(std::string name, VkImage image, VkImageView view,
                        VkFormat format, VkExtent2D extent,
-                       VkImageLayout currentLayout);
+                       VkImageLayout currentLayout,
+                       VkPipelineStageFlags2 lastStage =
+                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                       VkAccessFlags2 lastAccess = VK_ACCESS_2_NONE,
+                       bool isDepth = false);
 
     // Creates (or reuses from the pool) a graph-owned transient image.
     Handle createImage(std::string name, VkFormat format, VkExtent2D extent,
@@ -45,6 +52,13 @@ public:
         Handle handle = 0;
         VkAttachmentLoadOp loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         VkClearValue clear{};
+        // Renders into this view instead of the resource's default one
+        // (e.g. a single layer of a cascade array). Barriers still cover the
+        // whole image.
+        VkImageView viewOverride = VK_NULL_HANDLE;
+        // Render area when viewOverride has a different size than the
+        // resource (zero = use resource extent).
+        VkExtent2D extentOverride{};
     };
 
     struct Pass {
@@ -60,6 +74,9 @@ public:
     // Requests a layout the image must be in after the graph runs
     // (e.g. PRESENT_SRC for the backbuffer).
     void setFinalLayout(Handle handle, VkImageLayout layout);
+
+    // Default view of a graph resource (for bindless registration).
+    VkImageView view(Handle handle) const { return m_resources[handle].view; }
 
     // Records barriers, dynamic rendering scopes, and pass bodies.
     // tracyCtx may be null.
