@@ -175,6 +175,46 @@ void wholeImageBarrier(VkCommandBuffer cmd, VkImage image,
 
 } // namespace
 
+IBL placeholderIBL(Context& context) {
+    IBL ibl;
+    const VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    ibl.irradiance =
+        createCubeImage(context, VK_FORMAT_R16G16B16A16_SFLOAT, 1, usage);
+    ibl.prefiltered =
+        createCubeImage(context, VK_FORMAT_R16G16B16A16_SFLOAT, 1, usage);
+    ibl.brdfLut =
+        createImage2D(context, VK_FORMAT_R16G16_SFLOAT, {1, 1}, usage);
+
+    context.immediateSubmit([&](VkCommandBuffer cmd) {
+        for (GpuImage* image :
+             {&ibl.irradiance, &ibl.prefiltered, &ibl.brdfLut}) {
+            wholeImageBarrier(cmd, image->image, VK_IMAGE_LAYOUT_UNDEFINED,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                              VK_PIPELINE_STAGE_2_COPY_BIT,
+                              VK_ACCESS_2_TRANSFER_WRITE_BIT);
+            VkClearColorValue black{};
+            VkImageSubresourceRange range{};
+            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            range.levelCount = VK_REMAINING_MIP_LEVELS;
+            range.layerCount = VK_REMAINING_ARRAY_LAYERS;
+            vkCmdClearColorImage(cmd, image->image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black,
+                                 1, &range);
+            wholeImageBarrier(cmd, image->image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                              VK_PIPELINE_STAGE_2_COPY_BIT,
+                              VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                              VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                              VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+    });
+    return ibl;
+}
+
 IBL precomputeIBL(Context& context, ShaderCache& shaders,
                   const std::filesystem::path& hdriPath) {
     ZoneScoped;

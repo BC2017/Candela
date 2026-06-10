@@ -238,10 +238,10 @@ Renderer::Renderer(Window& window) : m_window(window) {
     m_shadowBindlessSlot = m_bindless->add(
         Bindless::Kind::Array2D, m_shadowMap.view, m_bindless->clampSampler());
 
-    // IBL precompute + registration.
-    m_ibl = precomputeIBL(*m_context, *m_shaderCache,
-                          std::filesystem::path(CANDELA_ASSET_DIR) / "hdri" /
-                              "kloofendal_48d_partly_cloudy_puresky_2k.hdr");
+    // Environment lighting bakes lazily (first frame with geometry); until
+    // then 1×1 black stand-ins keep every bindless slot valid. Empty scenes
+    // — the editor's startup state — never pay for the bake.
+    m_ibl = placeholderIBL(*m_context);
     m_irradianceSlot = m_bindless->add(Bindless::Kind::Cube, m_ibl.irradiance.view,
                                        m_bindless->clampSampler());
     m_prefilteredSlot = m_bindless->add(Bindless::Kind::Cube,
@@ -449,6 +449,7 @@ Renderer::~Renderer() {
     destroyTemporalTarget(m_reflectionsTemporal);
     destroyTemporalTarget(m_taaTemporal);
     m_ibl.destroy(*m_context);
+    m_iblPlaceholder.destroy(*m_context);
     for (VkImageView view : m_shadowLayerViews) {
         if (view != VK_NULL_HANDLE) {
             vkDestroyImageView(m_context->device(), view, nullptr);
@@ -1701,6 +1702,27 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     m_stats.pointLights = static_cast<uint32_t>(m_frameLights.size());
     m_stats.rayTracingSupported = m_rtSupported;
     m_stats.sceneExtent = sceneExtent;
+
+    // First geometry in view → bake the environment lighting for real. The
+    // placeholder stays alive until shutdown; frames in flight may still
+    // sample its descriptors.
+    if (!m_iblReady && !m_frameDraws.empty()) {
+        m_iblPlaceholder = m_ibl;
+        m_ibl = precomputeIBL(*m_context, *m_shaderCache,
+                              std::filesystem::path(CANDELA_ASSET_DIR) /
+                                  "hdri" /
+                                  "kloofendal_48d_partly_cloudy_puresky_2k.hdr");
+        m_irradianceSlot = m_bindless->add(
+            Bindless::Kind::Cube, m_ibl.irradiance.view,
+            m_bindless->clampSampler());
+        m_prefilteredSlot = m_bindless->add(
+            Bindless::Kind::Cube, m_ibl.prefiltered.view,
+            m_bindless->clampSampler());
+        m_brdfLutSlot = m_bindless->add(Bindless::Kind::Texture2D,
+                                        m_ibl.brdfLut.view,
+                                        m_bindless->clampSampler());
+        m_iblReady = true;
+    }
 
     FrameData& frame = m_frames[m_frameIndex];
     VkDevice device = m_context->device();

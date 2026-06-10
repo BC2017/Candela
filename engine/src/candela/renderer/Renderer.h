@@ -249,6 +249,8 @@ private:
     bool m_shadowMapEverRendered = false;
 
     IBL m_ibl;
+    IBL m_iblPlaceholder; // retired after the real bake; freed in the dtor
+    bool m_iblReady = false;
     uint32_t m_irradianceSlot = 0;
     uint32_t m_prefilteredSlot = 0;
     uint32_t m_brdfLutSlot = 0;
