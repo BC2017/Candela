@@ -1,10 +1,11 @@
 #pragma once
 
+#include "candela/core/Compiler.h"
 #include "candela/rhi/VulkanCommon.h"
 
-#pragma warning(push, 0)
+CD_PUSH_DISABLE_WARNINGS
 #include <vk_mem_alloc.h>
-#pragma warning(pop)
+CD_POP_WARNINGS
 
 #include <cstddef>
 #include <span>

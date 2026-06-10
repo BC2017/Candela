@@ -1,5 +1,7 @@
 #pragma once
 
+#include "candela/core/Compiler.h"
+
 #include <spdlog/spdlog.h>
 
 #include <memory>
@@ -30,6 +32,6 @@ private:
             CD_ERROR("Assertion failed: `{}` at {}:{}", #cond, __FILE__,       \
                      __LINE__);                                                \
             __VA_OPT__(CD_ERROR(__VA_ARGS__);)                                 \
-            __debugbreak();                                                    \
+            CD_DEBUGBREAK();                                                   \
         }                                                                      \
     } while (0)

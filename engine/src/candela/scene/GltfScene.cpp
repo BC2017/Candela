@@ -10,7 +10,6 @@
 
 #include <tracy/Tracy.hpp>
 
-#include <cstring>
 #include <unordered_map>
 
 namespace candela {
@@ -226,9 +225,15 @@ Scene loadGltfScene(Context& context, Bindless& bindless,
             if (!node.meshIndex) {
                 return;
             }
+            // Both are column-major; copy by element (memcpy into a glm type
+            // trips GCC's -Wclass-memaccess).
             glm::mat4 transform;
-            static_assert(sizeof(transform) == sizeof(matrix));
-            std::memcpy(&transform, &matrix, sizeof(transform));
+            for (glm::length_t col = 0; col < 4; ++col) {
+                for (glm::length_t row = 0; row < 4; ++row) {
+                    transform[col][row] = matrix[static_cast<size_t>(col)][
+                        static_cast<size_t>(row)];
+                }
+            }
 
             for (const auto& primitive :
                  asset.meshes[*node.meshIndex].primitives) {

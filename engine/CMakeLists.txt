@@ -20,6 +20,16 @@ if(MSVC)
   # fastgltf's accessor templates trip C4100 when instantiated under /W4.
   set_source_files_properties(src/candela/scene/GltfScene.cpp
       PROPERTIES COMPILE_OPTIONS "/wd4100")
+else()
+  # Same warning, GCC spelling; -Wredundant-move fires inside fastgltf 0.8
+  # headers (fixed upstream after our pinned tag).
+  set_source_files_properties(src/candela/scene/GltfScene.cpp
+      PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-redundant-move")
+  # Third-party implementation TUs are too warning-heavy for -Wall -Werror.
+  set_source_files_properties(
+      src/candela/rhi/VmaUsage.cpp
+      src/candela/scene/StbUsage.cpp
+      PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 target_compile_definitions(candela PUBLIC
