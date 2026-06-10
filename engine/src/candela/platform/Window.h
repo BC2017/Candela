@@ -35,6 +35,15 @@ public:
     // Returns true once after the framebuffer was resized, then clears the flag.
     bool consumeResizeFlag();
 
+    bool isKeyDown(int glfwKey) const;
+    bool isMouseButtonDown(int glfwButton) const;
+
+    // Cursor movement since the last pollEvents(), then resets to zero.
+    glm::vec2 consumeMouseDelta();
+
+    // Hides and locks the cursor (for mouse-look) when true.
+    void setCursorCaptured(bool captured);
+
     void setTitle(const std::string& title);
     GLFWwindow* handle() const { return m_window; }
 
@@ -43,6 +52,9 @@ private:
 
     GLFWwindow* m_window = nullptr;
     bool m_resized = false;
+    bool m_cursorCaptured = false;
+    glm::vec2 m_lastCursorPos{0.0f};
+    glm::vec2 m_mouseDelta{0.0f};
 };
 
 } // namespace candela

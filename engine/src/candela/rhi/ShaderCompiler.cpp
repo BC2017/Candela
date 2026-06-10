@@ -48,11 +48,12 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
 
     // std::system goes through cmd.exe; the outer quotes make cmd preserve the
     // quoting of the individual paths.
+    // Column-major matrix layout so GLM matrices upload without transposes.
     const std::string command =
         "\"\"" + m_slangc.string() + "\" \"" + sourcePath.string() +
         "\" -entry " + entry + " -stage " + stageName(stage) +
-        " -target spirv -o \"" + spvPath.string() + "\" 2> \"" +
-        errPath.string() + "\"\"";
+        " -target spirv -matrix-layout-column-major -o \"" +
+        spvPath.string() + "\" 2> \"" + errPath.string() + "\"\"";
 
     const int exitCode = std::system(command.c_str());
     if (exitCode != 0) {
@@ -73,6 +74,85 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
     spv.seekg(0);
     spv.read(reinterpret_cast<char*>(words.data()), size);
     return words;
+}
+
+namespace {
+
+uint64_t fnv1aHash(const std::vector<uint32_t>& words) {
+    uint64_t hash = 14695981039346656037ull;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(words.data());
+    const size_t byteCount = words.size() * sizeof(uint32_t);
+    for (size_t i = 0; i < byteCount; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+} // namespace
+
+ShaderCache::ShaderCache(VkDevice device) : m_device(device) {}
+
+ShaderCache::~ShaderCache() {
+    for (auto& [hash, entry] : m_modules) {
+        vkDestroyShaderModule(m_device, entry.first, nullptr);
+    }
+}
+
+void ShaderCache::releaseModule(uint64_t hash) {
+    auto it = m_modules.find(hash);
+    if (it == m_modules.end()) {
+        return;
+    }
+    if (--it->second.second == 0) {
+        vkDestroyShaderModule(m_device, it->second.first, nullptr);
+        m_modules.erase(it);
+    }
+}
+
+VkShaderModule ShaderCache::get(const std::filesystem::path& sourcePath,
+                                const std::string& entry, ShaderStage stage) {
+    const std::string key = sourcePath.string() + "|" + entry + "|" +
+                            std::to_string(static_cast<int>(stage));
+
+    std::error_code ec;
+    const auto sourceTime = std::filesystem::last_write_time(sourcePath, ec);
+    CD_ASSERT(!ec, "Shader source missing: {}", sourcePath.string());
+
+    auto found = m_entries.find(key);
+    if (found != m_entries.end() && found->second.sourceTime == sourceTime) {
+        return found->second.module;
+    }
+
+    auto spirv = m_compiler.compile(sourcePath, entry, stage);
+    if (!spirv) {
+        return VK_NULL_HANDLE;
+    }
+
+    const uint64_t hash = fnv1aHash(*spirv);
+
+    if (found != m_entries.end()) {
+        if (found->second.spirvHash == hash) {
+            // Source touched but SPIR-V unchanged — keep the module.
+            found->second.sourceTime = sourceTime;
+            return found->second.module;
+        }
+        releaseModule(found->second.spirvHash);
+        m_entries.erase(found);
+    }
+
+    VkShaderModule module = VK_NULL_HANDLE;
+    auto existing = m_modules.find(hash);
+    if (existing != m_modules.end()) {
+        module = existing->second.first;
+        ++existing->second.second;
+    } else {
+        module = createShaderModule(m_device, *spirv);
+        m_modules.emplace(hash, std::make_pair(module, 1u));
+    }
+
+    m_entries.emplace(key, Entry{hash, module, sourceTime});
+    return module;
 }
 
 VkShaderModule createShaderModule(VkDevice device,

@@ -1,38 +1,25 @@
 #include "candela/renderer/Renderer.h"
 
 #include "candela/platform/Window.h"
+#include "candela/renderer/Camera.h"
 
 #include <tracy/Tracy.hpp>
+
+#include <cstring>
 
 namespace candela {
 
 namespace {
 
-void transitionImage(VkCommandBuffer cmd, VkImage image, VkImageLayout oldLayout,
-                     VkImageLayout newLayout, VkPipelineStageFlags2 srcStage,
-                     VkAccessFlags2 srcAccess, VkPipelineStageFlags2 dstStage,
-                     VkAccessFlags2 dstAccess) {
-    VkImageMemoryBarrier2 barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barrier.srcStageMask = srcStage;
-    barrier.srcAccessMask = srcAccess;
-    barrier.dstStageMask = dstStage;
-    barrier.dstAccessMask = dstAccess;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkDependencyInfo dependency{};
-    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    dependency.imageMemoryBarrierCount = 1;
-    dependency.pImageMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &dependency);
-}
+// Must match DrawPush in mesh.slang.
+struct DrawPush {
+    glm::mat4 mvp;
+    VkDeviceAddress vertices;
+    uint32_t textureIndex;
+    uint32_t flags;
+    glm::vec4 baseColorFactor;
+};
+static_assert(sizeof(DrawPush) == 96, "DrawPush layout must match mesh.slang");
 
 } // namespace
 
@@ -41,35 +28,56 @@ Renderer::Renderer(Window& window) : m_window(window) {
 
     const glm::uvec2 fb = window.framebufferSize();
     m_swapchain = std::make_unique<Swapchain>(*m_context, fb.x, fb.y);
+    m_bindless = std::make_unique<Bindless>(*m_context);
+    m_renderGraph = std::make_unique<RenderGraph>(*m_context);
+    m_shaderCache = std::make_unique<ShaderCache>(m_context->device());
 
     createFrameData();
     createPresentSemaphores();
 
-    VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushRange.offset = 0;
-    pushRange.size = sizeof(float); // time
+#ifdef TRACY_ENABLE
+    m_tracyCtx = TracyVkContext(m_context->physicalDevice(),
+                                m_context->device(),
+                                m_context->graphicsQueue(),
+                                m_context->immediateCommandBuffer());
+#endif
 
+    VkPushConstantRange pushRange{};
+    pushRange.stageFlags =
+        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.offset = 0;
+    pushRange.size = sizeof(DrawPush);
+
+    VkDescriptorSetLayout setLayout = m_bindless->layout();
     VkPipelineLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &setLayout;
     layoutInfo.pushConstantRangeCount = 1;
     layoutInfo.pPushConstantRanges = &pushRange;
     VK_CHECK(vkCreatePipelineLayout(m_context->device(), &layoutInfo, nullptr,
                                     &m_pipelineLayout));
 
-    m_shaderPath = std::filesystem::path(CANDELA_SHADER_DIR) / "fullscreen.slang";
+    m_shaderPath = std::filesystem::path(CANDELA_SHADER_DIR) / "mesh.slang";
     CD_ASSERT(std::filesystem::exists(m_shaderPath), "Shader not found: {}",
               m_shaderPath.string());
     m_shaderTimestamp = std::filesystem::last_write_time(m_shaderPath);
 
     CD_ASSERT(createPipeline(), "Initial shader compilation failed");
 
-    m_startTime = std::chrono::steady_clock::now();
-    m_lastReloadCheck = m_startTime;
+    m_lastReloadCheck = std::chrono::steady_clock::now();
 }
 
 Renderer::~Renderer() {
     m_context->waitIdle();
+
+    m_scene.destroy(*m_context);
+
+#ifdef TRACY_ENABLE
+    if (m_tracyCtx != nullptr) {
+        TracyVkDestroy(m_tracyCtx);
+    }
+#endif
 
     VkDevice device = m_context->device();
     if (m_pipeline != VK_NULL_HANDLE) {
@@ -80,8 +88,17 @@ Renderer::~Renderer() {
     }
     destroyPresentSemaphores();
     destroyFrameData();
+    m_shaderCache.reset();
+    m_renderGraph.reset();
+    m_bindless.reset();
     m_swapchain.reset();
     m_context.reset();
+}
+
+void Renderer::setScene(Scene scene) {
+    m_context->waitIdle();
+    m_scene.destroy(*m_context);
+    m_scene = std::move(scene);
 }
 
 void Renderer::createFrameData() {
@@ -140,17 +157,13 @@ void Renderer::destroyPresentSemaphores() {
 bool Renderer::createPipeline() {
     ZoneScoped;
 
-    auto vsWords =
-        m_shaderCompiler.compile(m_shaderPath, "vsMain", ShaderStage::Vertex);
-    auto fsWords =
-        m_shaderCompiler.compile(m_shaderPath, "fsMain", ShaderStage::Fragment);
-    if (!vsWords || !fsWords) {
+    VkShaderModule vs =
+        m_shaderCache->get(m_shaderPath, "vsMain", ShaderStage::Vertex);
+    VkShaderModule fs =
+        m_shaderCache->get(m_shaderPath, "fsMain", ShaderStage::Fragment);
+    if (vs == VK_NULL_HANDLE || fs == VK_NULL_HANDLE) {
         return false;
     }
-
-    VkDevice device = m_context->device();
-    VkShaderModule vs = createShaderModule(device, *vsWords);
-    VkShaderModule fs = createShaderModule(device, *fsWords);
 
     // slangc emits a single OpEntryPoint named "main" regardless of the
     // source entry name (verified with spirv-dis).
@@ -182,7 +195,7 @@ bool Renderer::createPipeline() {
     rasterization.sType =
         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
     rasterization.polygonMode = VK_POLYGON_MODE_FILL;
-    rasterization.cullMode = VK_CULL_MODE_NONE;
+    rasterization.cullMode = VK_CULL_MODE_BACK_BIT;
     rasterization.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     rasterization.lineWidth = 1.0f;
 
@@ -190,6 +203,14 @@ bool Renderer::createPipeline() {
     multisample.sType =
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    // Reverse-Z: clear to 0, pass what's nearer (greater depth value).
+    VkPipelineDepthStencilStateCreateInfo depthStencil{};
+    depthStencil.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    depthStencil.depthTestEnable = VK_TRUE;
+    depthStencil.depthWriteEnable = VK_TRUE;
+    depthStencil.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState blendAttachment{};
     blendAttachment.colorWriteMask =
@@ -213,6 +234,7 @@ bool Renderer::createPipeline() {
     rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     rendering.colorAttachmentCount = 1;
     rendering.pColorAttachmentFormats = &colorFormat;
+    rendering.depthAttachmentFormat = kDepthFormat;
 
     VkGraphicsPipelineCreateInfo pipelineInfo{};
     pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -224,24 +246,22 @@ bool Renderer::createPipeline() {
     pipelineInfo.pViewportState = &viewport;
     pipelineInfo.pRasterizationState = &rasterization;
     pipelineInfo.pMultisampleState = &multisample;
+    pipelineInfo.pDepthStencilState = &depthStencil;
     pipelineInfo.pColorBlendState = &blend;
     pipelineInfo.pDynamicState = &dynamic;
     pipelineInfo.layout = m_pipelineLayout;
 
     VkPipeline newPipeline = VK_NULL_HANDLE;
     const VkResult result = vkCreateGraphicsPipelines(
-        device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &newPipeline);
-
-    vkDestroyShaderModule(device, vs, nullptr);
-    vkDestroyShaderModule(device, fs, nullptr);
-
+        m_context->device(), VK_NULL_HANDLE, 1, &pipelineInfo, nullptr,
+        &newPipeline);
     if (result != VK_SUCCESS) {
         CD_ERROR("vkCreateGraphicsPipelines failed: {}", string_VkResult(result));
         return false;
     }
 
     if (m_pipeline != VK_NULL_HANDLE) {
-        vkDestroyPipeline(device, m_pipeline, nullptr);
+        vkDestroyPipeline(m_context->device(), m_pipeline, nullptr);
     }
     m_pipeline = newPipeline;
     return true;
@@ -282,7 +302,8 @@ void Renderer::checkShaderHotReload() {
     }
 }
 
-void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
+void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
+                              const Camera& camera) {
     ZoneScoped;
 
     VkCommandBufferBeginInfo beginInfo{};
@@ -290,63 +311,80 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex) {
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
 
-    transitionImage(cmd, m_swapchain->image(imageIndex),
-                    VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, VK_ACCESS_2_NONE,
-                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-
-    VkRenderingAttachmentInfo colorAttachment{};
-    colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAttachment.imageView = m_swapchain->view(imageIndex);
-    colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.clearValue.color = {{0.02f, 0.02f, 0.03f, 1.0f}};
-
     const VkExtent2D extent = m_swapchain->extent();
-    VkRenderingInfo renderingInfo{};
-    renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-    renderingInfo.renderArea = {{0, 0}, extent};
-    renderingInfo.layerCount = 1;
-    renderingInfo.colorAttachmentCount = 1;
-    renderingInfo.pColorAttachments = &colorAttachment;
+    const float aspect = static_cast<float>(extent.width) /
+                         static_cast<float>(extent.height);
+    const glm::mat4 viewProjection = camera.viewProjection(aspect);
 
-    vkCmdBeginRendering(cmd, &renderingInfo);
+    RenderGraph& graph = *m_renderGraph;
+    graph.begin();
 
-    VkViewport viewport{};
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.maxDepth = 1.0f;
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    const RenderGraph::Handle backbuffer = graph.importImage(
+        "backbuffer", m_swapchain->image(imageIndex),
+        m_swapchain->view(imageIndex), m_swapchain->format(), extent,
+        VK_IMAGE_LAYOUT_UNDEFINED);
+    const RenderGraph::Handle depth =
+        graph.createImage("depth", kDepthFormat, extent,
+                          VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
 
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
+    RenderGraph::Pass forward;
+    forward.name = "forward";
+    forward.colorAttachments.push_back(
+        {backbuffer, VK_ATTACHMENT_LOAD_OP_CLEAR,
+         {.color = {{0.02f, 0.02f, 0.03f, 1.0f}}}});
+    forward.depthAttachment = RenderGraph::Attachment{
+        depth, VK_ATTACHMENT_LOAD_OP_CLEAR, {.depthStencil = {0.0f, 0}}};
+    forward.execute = [&](VkCommandBuffer passCmd) {
+        ZoneScopedN("forward");
 
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+        // Negative-height viewport: Y up, matching glTF/GL conventions.
+        VkViewport viewport{};
+        viewport.y = static_cast<float>(extent.height);
+        viewport.width = static_cast<float>(extent.width);
+        viewport.height = -static_cast<float>(extent.height);
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(passCmd, 0, 1, &viewport);
 
-    const float time = std::chrono::duration<float>(
-                           std::chrono::steady_clock::now() - m_startTime)
-                           .count();
-    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                       sizeof(float), &time);
+        VkRect2D scissor{{0, 0}, extent};
+        vkCmdSetScissor(passCmd, 0, 1, &scissor);
 
-    vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
 
-    vkCmdEndRendering(cmd);
+        VkDescriptorSet set = m_bindless->set();
+        vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                m_pipelineLayout, 0, 1, &set, 0, nullptr);
 
-    transitionImage(cmd, m_swapchain->image(imageIndex),
-                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                    VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-                    VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, VK_ACCESS_2_NONE);
+        for (const DrawItem& draw : m_scene.draws) {
+            DrawPush push{};
+            push.mvp = viewProjection * draw.transform;
+            push.vertices = draw.vertexAddress;
+            push.textureIndex = draw.textureIndex;
+            push.flags = draw.flags;
+            push.baseColorFactor = draw.baseColorFactor;
+            vkCmdPushConstants(passCmd, m_pipelineLayout,
+                               VK_SHADER_STAGE_VERTEX_BIT |
+                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(push), &push);
+            vkCmdBindIndexBuffer(passCmd, draw.indexBuffer, 0,
+                                 VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexed(passCmd, draw.indexCount, 1, 0, 0, 0);
+        }
+    };
+    graph.addPass(std::move(forward));
+
+    graph.setFinalLayout(backbuffer, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+    graph.execute(cmd, m_tracyCtx);
+
+#ifdef TRACY_ENABLE
+    if (m_tracyCtx != nullptr) {
+        TracyVkCollect(m_tracyCtx, cmd);
+    }
+#endif
 
     VK_CHECK(vkEndCommandBuffer(cmd));
 }
 
-void Renderer::drawFrame() {
+void Renderer::drawFrame(const Camera& camera) {
     ZoneScoped;
 
     checkShaderHotReload();
@@ -380,7 +418,7 @@ void Renderer::drawFrame() {
     VK_CHECK(vkResetFences(device, 1, &frame.inFlightFence));
     VK_CHECK(vkResetCommandPool(device, frame.pool, 0));
 
-    recordCommands(frame.cmd, imageIndex);
+    recordCommands(frame.cmd, imageIndex, camera);
 
     VkCommandBufferSubmitInfo cmdInfo{};
     cmdInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO;

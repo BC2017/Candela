@@ -1,14 +1,26 @@
 add_library(candela STATIC
     src/candela/core/Log.cpp
     src/candela/platform/Window.cpp
+    src/candela/rhi/Bindless.cpp
     src/candela/rhi/Context.cpp
+    src/candela/rhi/RenderGraph.cpp
+    src/candela/rhi/Resources.cpp
     src/candela/rhi/ShaderCompiler.cpp
     src/candela/rhi/Swapchain.cpp
     src/candela/rhi/VmaUsage.cpp
+    src/candela/renderer/Camera.cpp
     src/candela/renderer/Renderer.cpp
+    src/candela/scene/GltfScene.cpp
+    src/candela/scene/StbUsage.cpp
 )
 
 target_include_directories(candela PUBLIC src)
+
+if(MSVC)
+  # fastgltf's accessor templates trip C4100 when instantiated under /W4.
+  set_source_files_properties(src/candela/scene/GltfScene.cpp
+      PROPERTIES COMPILE_OPTIONS "/wd4100")
+endif()
 
 target_compile_definitions(candela PUBLIC
     VK_NO_PROTOTYPES
@@ -16,6 +28,7 @@ target_compile_definitions(candela PUBLIC
     GLM_FORCE_DEPTH_ZERO_TO_ONE
     GLM_FORCE_RADIANS
     CANDELA_SHADER_DIR="${CMAKE_SOURCE_DIR}/shaders"
+    CANDELA_ASSET_DIR="${CMAKE_SOURCE_DIR}/assets"
 )
 
 target_link_libraries(candela PUBLIC
@@ -27,6 +40,8 @@ target_link_libraries(candela PUBLIC
     spdlog::spdlog
     Tracy::TracyClient
     Vulkan::Headers
+    fastgltf::fastgltf
+    stb
 )
 
 candela_apply_warnings(candela)
