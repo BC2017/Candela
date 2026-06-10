@@ -58,6 +58,11 @@ struct SceneSettings {
     float iblIntensity = 0.8f;
     float exposure = 1.0f;
     float bloomStrength = 0.05f;
+    // Ray-traced effects (ignored on devices without ray tracing — the
+    // raster fallbacks render instead).
+    bool rtShadows = true;
+    bool rtAmbientOcclusion = true;
+    bool rtReflections = true;
 };
 
 } // namespace candela

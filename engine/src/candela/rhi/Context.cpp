@@ -63,6 +63,7 @@ Context::Context(Window& window) {
     features12.runtimeDescriptorArray = VK_TRUE;
     features12.descriptorBindingPartiallyBound = VK_TRUE;
     features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingStorageImageUpdateAfterBind = VK_TRUE;
     features12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
     features12.scalarBlockLayout = VK_TRUE;
 
@@ -75,14 +76,46 @@ Context::Context(Window& window) {
     VkPhysicalDeviceFeatures features10{};
     features10.samplerAnisotropy = VK_TRUE;
 
-    auto physicalResult = vkb::PhysicalDeviceSelector{vkbInstance}
-                              .set_surface(m_surface)
-                              .set_minimum_version(1, 3)
-                              .set_required_features_13(features13)
-                              .set_required_features_12(features12)
-                              .set_required_features_11(features11)
-                              .set_required_features(features10)
-                              .select();
+    // Ray tracing (acceleration structures + ray queries) is requested first;
+    // if no device qualifies, fall back to raster-only.
+    VkPhysicalDeviceAccelerationStructureFeaturesKHR asFeatures{};
+    asFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+    asFeatures.accelerationStructure = VK_TRUE;
+    asFeatures.descriptorBindingAccelerationStructureUpdateAfterBind = VK_TRUE;
+
+    VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
+    rayQueryFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+    rayQueryFeatures.rayQuery = VK_TRUE;
+
+    auto selectDevice = [&](bool withRayTracing) {
+        vkb::PhysicalDeviceSelector selector{vkbInstance};
+        selector.set_surface(m_surface)
+            .set_minimum_version(1, 3)
+            .set_required_features_13(features13)
+            .set_required_features_12(features12)
+            .set_required_features_11(features11)
+            .set_required_features(features10);
+        if (withRayTracing) {
+            selector
+                .add_required_extension(
+                    VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
+                .add_required_extension(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                .add_required_extension(
+                    VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME)
+                .add_required_extension_features(asFeatures)
+                .add_required_extension_features(rayQueryFeatures);
+        }
+        return selector.select();
+    };
+
+    auto physicalResult = selectDevice(true);
+    m_rayTracingSupported = physicalResult.has_value();
+    if (!m_rayTracingSupported) {
+        CD_WARN("No ray-tracing-capable GPU — RT effects fall back to raster");
+        physicalResult = selectDevice(false);
+    }
     CD_ASSERT(physicalResult.has_value(),
               "No GPU supports the required Vulkan 1.3 features: {}",
               physicalResult.error().message());

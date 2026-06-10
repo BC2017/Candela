@@ -29,6 +29,7 @@ enum class DebugView : uint32_t {
     MetallicRoughness = 3,
     Occlusion = 4,
     Cascades = 5,
+    Reflections = 6,
 };
 
 // Editor-facing per-frame options. With viewportExtent set, the scene renders
@@ -92,6 +93,15 @@ private:
         VkFence inFlightFence = VK_NULL_HANDLE;
         GpuBuffer constants;
         void* constantsMapped = nullptr;
+        // Ray tracing (per frame in flight so rebuilds never race the GPU).
+        VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+        GpuBuffer tlasBuffer;
+        GpuBuffer tlasScratch;
+        GpuBuffer tlasInstances; // VkAccelerationStructureInstanceKHR[], mapped
+        void* tlasInstancesMapped = nullptr;
+        GpuBuffer instanceData; // InstanceDataGPU[], mapped
+        void* instanceDataMapped = nullptr;
+        uint32_t tlasSlot = 0; // bindless AccelStruct index
     };
 
     struct PipelineDesc {
@@ -129,7 +139,15 @@ private:
     };
 
     VkPipeline buildPipeline(const PipelineDesc& desc);
+    VkPipeline buildComputePipeline(const std::string& shaderFile,
+                                    const std::string& entry);
     bool createPipelines();
+    void createRayTracingResources();
+    // Fills instance/data buffers from the ECS; returns instance count.
+    uint32_t fillRayTracingInstances(FrameData& frame, World& world,
+                                     AssetRegistry& assets);
+    void buildTLAS(VkCommandBuffer cmd, FrameData& frame,
+                   uint32_t instanceCount);
 
     void recreateSwapchain();
     void checkShaderHotReload();
@@ -162,6 +180,13 @@ private:
     VkPipeline m_bloomDownPipeline = VK_NULL_HANDLE;
     VkPipeline m_bloomUpPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
+    VkPipeline m_reflectionsPipeline = VK_NULL_HANDLE; // null without RT
+
+    static constexpr uint32_t kMaxRTInstances = 1024;
+    static constexpr uint32_t kMaxRTInstanceData = 4096;
+    bool m_rtSupported = false;
+    uint32_t m_rtInstanceCount = 0; // filled per frame before recording
+    std::unordered_map<VkImageView, uint32_t> m_storageSlots;
 
     // Persistent shadow cascade array (D32, kShadowMapSize², 4 layers).
     GpuImage m_shadowMap;

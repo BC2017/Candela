@@ -32,9 +32,36 @@ struct FrameConstants {
     uint32_t pointLightCount;
     uint32_t pad0, pad1, pad2;
     PointLightGPU pointLights[8];
+    uint32_t rtFlags; // bit 0 shadows, 1 AO, 2 reflections
+    uint32_t tlasSlot;
+    uint32_t pad3, pad4;
+    VkDeviceAddress instanceData; // InstanceDataGPU*
+    uint64_t pad5;
 };
-static_assert(sizeof(FrameConstants) == 720,
+static_assert(sizeof(FrameConstants) == 752,
               "FrameConstants must match common.slang");
+
+// Per-TLAS-geometry shading data for ray-query hit evaluation.
+// Must match InstanceData in common.slang.
+struct InstanceDataGPU {
+    VkDeviceAddress vertices;
+    VkDeviceAddress indices;
+    uint32_t albedoTexture;
+    uint32_t flags;
+    float metallicFactor;
+    float roughnessFactor;
+    glm::vec4 baseColorFactor;
+};
+static_assert(sizeof(InstanceDataGPU) == 48,
+              "InstanceDataGPU must match common.slang");
+
+constexpr uint32_t kRTShadowsBit = 1;
+constexpr uint32_t kRTAOBit = 2;
+constexpr uint32_t kRTReflectionsBit = 4;
+
+constexpr VkShaderStageFlags kPushStages = VK_SHADER_STAGE_VERTEX_BIT |
+                                           VK_SHADER_STAGE_FRAGMENT_BIT |
+                                           VK_SHADER_STAGE_COMPUTE_BIT;
 
 struct GBufferPush {
     glm::mat4 model;
@@ -71,6 +98,20 @@ struct LightingPush {
     float iblIntensity;
     uint32_t prefilteredMips;
     uint32_t debugView;
+    uint32_t reflectionTexture; // RT reflections buffer (when rtFlags bit 2)
+};
+
+struct ReflectionsPush {
+    VkDeviceAddress frame;
+    uint32_t gbNormal;
+    uint32_t gbMaterial;
+    uint32_t gbDepth;
+    uint32_t outputImage; // storage slot
+    glm::uvec2 resolution;
+    uint32_t prefilteredCube;
+    uint32_t irradianceCube;
+    float iblIntensity;
+    uint32_t prefilteredMips;
 };
 
 struct BloomPush {
@@ -123,8 +164,7 @@ Renderer::Renderer(Window& window) : m_window(window) {
 
     // Shared graphics pipeline layout: bindless set + 128B push constants.
     VkPushConstantRange pushRange{};
-    pushRange.stageFlags =
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    pushRange.stageFlags = kPushStages;
     pushRange.offset = 0;
     pushRange.size = 128;
 
@@ -181,6 +221,12 @@ Renderer::Renderer(Window& window) : m_window(window) {
                                     m_ibl.brdfLut.view,
                                     m_bindless->clampSampler());
 
+    m_rtSupported = m_context->rayTracingSupported();
+    if (m_rtSupported) {
+        createRayTracingResources();
+        CD_INFO("Ray tracing enabled (acceleration structures + ray queries)");
+    }
+
     std::error_code ec;
     m_shaderTimestamp = std::filesystem::file_time_type{};
     for (const auto& entry :
@@ -191,6 +237,176 @@ Renderer::Renderer(Window& window) : m_window(window) {
 
     CD_ASSERT(createPipelines(), "Initial shader compilation failed");
     m_lastReloadCheck = std::chrono::steady_clock::now();
+}
+
+void Renderer::createRayTracingResources() {
+    VkDevice device = m_context->device();
+
+    // Sizes are queried once for the worst case; per-frame builds reuse the
+    // same buffers with the actual instance count.
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geometry.geometry.instances.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags =
+        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+
+    const uint32_t maxInstances = kMaxRTInstances;
+    VkAccelerationStructureBuildSizesInfoKHR sizes{};
+    sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+    vkGetAccelerationStructureBuildSizesKHR(
+        device, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo,
+        &maxInstances, &sizes);
+
+    for (FrameData& frame : m_frames) {
+        frame.tlasBuffer = createBuffer(
+            *m_context, sizes.accelerationStructureSize,
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+
+        VkAccelerationStructureCreateInfoKHR createInfo{};
+        createInfo.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+        createInfo.buffer = frame.tlasBuffer.buffer;
+        createInfo.size = sizes.accelerationStructureSize;
+        createInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+        VK_CHECK(vkCreateAccelerationStructureKHR(device, &createInfo, nullptr,
+                                                  &frame.tlas));
+
+        frame.tlasScratch = createBuffer(
+            *m_context, sizes.buildScratchSize + m_context->scratchAlignment(),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+
+        frame.tlasInstances = createBuffer(
+            *m_context,
+            kMaxRTInstances * sizeof(VkAccelerationStructureInstanceKHR),
+            VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(m_context->allocator(),
+                             frame.tlasInstances.allocation, &info);
+        frame.tlasInstancesMapped = info.pMappedData;
+
+        frame.instanceData = createBuffer(
+            *m_context, kMaxRTInstanceData * sizeof(InstanceDataGPU),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        vmaGetAllocationInfo(m_context->allocator(),
+                             frame.instanceData.allocation, &info);
+        frame.instanceDataMapped = info.pMappedData;
+
+        frame.tlasSlot = m_bindless->addAccelerationStructure(frame.tlas);
+    }
+}
+
+uint32_t Renderer::fillRayTracingInstances(FrameData& frame, World& world,
+                                           AssetRegistry& assets) {
+    ZoneScoped;
+    auto* instances = static_cast<VkAccelerationStructureInstanceKHR*>(
+        frame.tlasInstancesMapped);
+    auto* data = static_cast<InstanceDataGPU*>(frame.instanceDataMapped);
+    uint32_t instanceCount = 0;
+    uint32_t dataCount = 0;
+
+    for (auto [entity, transform, mesh] :
+         world.registry.view<WorldTransform, MeshRenderer>().each()) {
+        const ModelAsset* model = assets.tryGetModel(mesh.model);
+        if (model == nullptr || mesh.meshIndex >= model->meshes.size()) {
+            continue;
+        }
+        const GpuMesh& gpuMesh = model->meshes[mesh.meshIndex];
+        if (gpuMesh.blas == VK_NULL_HANDLE ||
+            instanceCount >= kMaxRTInstances ||
+            dataCount + gpuMesh.primitives.size() > kMaxRTInstanceData) {
+            continue;
+        }
+
+        VkAccelerationStructureInstanceKHR& instance =
+            instances[instanceCount++];
+        instance = {};
+        const glm::mat4& m = transform.value;
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                instance.transform.matrix[row][col] = m[col][row];
+            }
+        }
+        instance.instanceCustomIndex = dataCount;
+        instance.mask = 0xFF;
+        instance.flags =
+            VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        instance.accelerationStructureReference = gpuMesh.blasAddress;
+
+        for (const GpuPrimitive& primitive : gpuMesh.primitives) {
+            InstanceDataGPU& entry = data[dataCount++];
+            entry.vertices = primitive.vertexBuffer.deviceAddress;
+            entry.indices = primitive.indexBuffer.deviceAddress;
+            entry.albedoTexture = primitive.albedoTexture;
+            entry.flags = primitive.flags;
+            entry.metallicFactor = primitive.metallicFactor;
+            entry.roughnessFactor = primitive.roughnessFactor;
+            entry.baseColorFactor = primitive.baseColorFactor;
+        }
+    }
+    return instanceCount;
+}
+
+void Renderer::buildTLAS(VkCommandBuffer cmd, FrameData& frame,
+                         uint32_t instanceCount) {
+    VkAccelerationStructureGeometryKHR geometry{};
+    geometry.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geometry.geometryType = VK_GEOMETRY_TYPE_INSTANCES_KHR;
+    geometry.geometry.instances.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
+    geometry.geometry.instances.data.deviceAddress =
+        frame.tlasInstances.deviceAddress;
+
+    VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+    buildInfo.sType =
+        VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+    buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+    buildInfo.flags =
+        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR;
+    buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+    buildInfo.geometryCount = 1;
+    buildInfo.pGeometries = &geometry;
+    buildInfo.dstAccelerationStructure = frame.tlas;
+    const VkDeviceAddress alignment = m_context->scratchAlignment();
+    buildInfo.scratchData.deviceAddress =
+        (frame.tlasScratch.deviceAddress + alignment - 1) & ~(alignment - 1);
+
+    VkAccelerationStructureBuildRangeInfoKHR range{};
+    range.primitiveCount = instanceCount;
+    const VkAccelerationStructureBuildRangeInfoKHR* rangePtr = &range;
+    vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &rangePtr);
+
+    // Build → ray-query reads in fragment/compute.
+    VkMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    barrier.srcStageMask =
+        VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    barrier.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    VkDependencyInfo dependency{};
+    dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dependency.memoryBarrierCount = 1;
+    dependency.pMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
 Renderer::~Renderer() {
@@ -215,7 +431,8 @@ Renderer::~Renderer() {
     VkDevice device = m_context->device();
     for (VkPipeline pipeline :
          {m_gbufferPipeline, m_shadowPipeline, m_lightingPipeline,
-          m_bloomDownPipeline, m_bloomUpPipeline, m_tonemapPipeline}) {
+          m_bloomDownPipeline, m_bloomUpPipeline, m_tonemapPipeline,
+          m_reflectionsPipeline}) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
         }
@@ -273,6 +490,13 @@ void Renderer::createFrameData() {
 void Renderer::destroyFrameData() {
     VkDevice device = m_context->device();
     for (FrameData& frame : m_frames) {
+        if (frame.tlas != VK_NULL_HANDLE) {
+            vkDestroyAccelerationStructureKHR(device, frame.tlas, nullptr);
+            destroyBuffer(*m_context, frame.tlasBuffer);
+            destroyBuffer(*m_context, frame.tlasScratch);
+            destroyBuffer(*m_context, frame.tlasInstances);
+            destroyBuffer(*m_context, frame.instanceData);
+        }
         destroyBuffer(*m_context, frame.constants);
         vkDestroyFence(device, frame.inFlightFence, nullptr);
         vkDestroySemaphore(device, frame.acquireSemaphore, nullptr);
@@ -431,6 +655,31 @@ VkPipeline Renderer::buildPipeline(const PipelineDesc& desc) {
     return pipeline;
 }
 
+VkPipeline Renderer::buildComputePipeline(const std::string& shaderFile,
+                                          const std::string& entry) {
+    VkShaderModule shader = m_shaderCache->get(m_shaderDir / shaderFile, entry,
+                                               ShaderStage::Compute);
+    if (shader == VK_NULL_HANDLE) {
+        return VK_NULL_HANDLE;
+    }
+    VkComputePipelineCreateInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+    info.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    info.stage.module = shader;
+    info.stage.pName = "main";
+    info.layout = m_pipelineLayout;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult result = vkCreateComputePipelines(
+        m_context->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
+    if (result != VK_SUCCESS) {
+        CD_ERROR("vkCreateComputePipelines failed for {}: {}", shaderFile,
+                 string_VkResult(result));
+        return VK_NULL_HANDLE;
+    }
+    return pipeline;
+}
+
 bool Renderer::createPipelines() {
     ZoneScoped;
 
@@ -472,13 +721,19 @@ bool Renderer::createPipelines() {
     tonemap.fsEntry = "fsMain";
     tonemap.colorFormats = {m_swapchain->format()};
 
-    VkPipeline newPipelines[6] = {
-        buildPipeline(gbuffer),  buildPipeline(shadow),
-        buildPipeline(lighting), buildPipeline(bloomDown),
-        buildPipeline(bloomUp),  buildPipeline(tonemap),
+    VkPipeline newPipelines[7] = {
+        buildPipeline(gbuffer),
+        buildPipeline(shadow),
+        buildPipeline(lighting),
+        buildPipeline(bloomDown),
+        buildPipeline(bloomUp),
+        buildPipeline(tonemap),
+        m_rtSupported ? buildComputePipeline("reflections.slang", "csMain")
+                      : VK_NULL_HANDLE,
     };
-    for (VkPipeline pipeline : newPipelines) {
-        if (pipeline == VK_NULL_HANDLE) {
+    const uint32_t required = m_rtSupported ? 7u : 6u;
+    for (uint32_t i = 0; i < required; ++i) {
+        if (newPipelines[i] == VK_NULL_HANDLE) {
             for (VkPipeline created : newPipelines) {
                 if (created != VK_NULL_HANDLE) {
                     vkDestroyPipeline(m_context->device(), created, nullptr);
@@ -488,10 +743,11 @@ bool Renderer::createPipelines() {
         }
     }
 
-    VkPipeline* slots[6] = {&m_gbufferPipeline,   &m_shadowPipeline,
+    VkPipeline* slots[7] = {&m_gbufferPipeline,   &m_shadowPipeline,
                             &m_lightingPipeline,  &m_bloomDownPipeline,
-                            &m_bloomUpPipeline,   &m_tonemapPipeline};
-    for (uint32_t i = 0; i < 6; ++i) {
+                            &m_bloomUpPipeline,   &m_tonemapPipeline,
+                            &m_reflectionsPipeline};
+    for (uint32_t i = 0; i < 7; ++i) {
         if (*slots[i] != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_context->device(), *slots[i], nullptr);
         }
@@ -599,6 +855,15 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
             glm::vec4(light.color, light.intensity);
     }
 
+    if (m_rtSupported) {
+        constants.rtFlags =
+            (settings.rtShadows ? kRTShadowsBit : 0) |
+            (settings.rtAmbientOcclusion ? kRTAOBit : 0) |
+            (settings.rtReflections ? kRTReflectionsBit : 0);
+        constants.tlasSlot = frame.tlasSlot;
+        constants.instanceData = frame.instanceData.deviceAddress;
+    }
+
     std::memcpy(frame.constantsMapped, &constants, sizeof(constants));
 }
 
@@ -624,6 +889,16 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &beginInfo));
+
+    // TLAS rebuild (cheap at this instance count; prepared in drawFrame).
+    const bool rtActive = m_rtSupported && m_rtInstanceCount > 0 &&
+                          (world.settings.rtShadows ||
+                           world.settings.rtAmbientOcclusion ||
+                           world.settings.rtReflections);
+    if (rtActive) {
+        TracyVkZone(m_tracyCtx, cmd, "tlas-build");
+        buildTLAS(cmd, frame, m_rtInstanceCount);
+    }
 
     RenderGraph& graph = *m_renderGraph;
     graph.begin();
@@ -699,9 +974,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 ShadowPush push{};
                 push.lightViewProjModel = cascadeMatrix * draw.transform;
                 push.vertices = draw.primitive->vertexBuffer.deviceAddress;
-                vkCmdPushConstants(passCmd, m_pipelineLayout,
-                                   VK_SHADER_STAGE_VERTEX_BIT |
-                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                    0, sizeof(push), &push);
                 vkCmdBindIndexBuffer(passCmd,
                                      draw.primitive->indexBuffer.buffer, 0,
@@ -750,14 +1023,63 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 push.roughnessFactor = primitive.roughnessFactor;
                 push.entityId = draw.entityId;
                 push.baseColorFactor = primitive.baseColorFactor;
-                vkCmdPushConstants(passCmd, m_pipelineLayout,
-                                   VK_SHADER_STAGE_VERTEX_BIT |
-                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                    0, sizeof(push), &push);
                 vkCmdBindIndexBuffer(passCmd, primitive.indexBuffer.buffer, 0,
                                      VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(passCmd, primitive.indexCount, 1, 0, 0, 0);
             }
+        };
+        graph.addPass(std::move(pass));
+    }
+
+    // --- RT reflections (compute, before lighting consumes the buffer) ---
+    RenderGraph::Handle rtReflections = 0;
+    const bool reflectionsActive =
+        rtActive && world.settings.rtReflections &&
+        m_reflectionsPipeline != VK_NULL_HANDLE;
+    if (reflectionsActive) {
+        rtReflections = graph.createImage(
+            "rt-reflections", kHdrFormat, extent,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+        // Storage slots are stable per view (pooled images persist).
+        const VkImageView view = graph.view(rtReflections);
+        uint32_t storageSlot;
+        if (auto it = m_storageSlots.find(view); it != m_storageSlots.end()) {
+            storageSlot = it->second;
+        } else {
+            storageSlot = m_bindless->add(Bindless::Kind::StorageImage, view,
+                                          VK_NULL_HANDLE);
+            m_storageSlots.emplace(view, storageSlot);
+        }
+
+        RenderGraph::Pass pass;
+        pass.name = "rt-reflections";
+        pass.sampledImages = {gbNormal, gbMaterial, depth};
+        pass.storageImages = {rtReflections};
+        ReflectionsPush push{};
+        push.frame = frameAddress;
+        push.gbNormal = slotFor(graph.view(gbNormal));
+        push.gbMaterial = slotFor(graph.view(gbMaterial));
+        push.gbDepth = slotFor(graph.view(depth));
+        push.outputImage = storageSlot;
+        push.resolution = {extent.width, extent.height};
+        push.prefilteredCube = m_prefilteredSlot;
+        push.irradianceCube = m_irradianceSlot;
+        push.iblIntensity = world.settings.iblIntensity;
+        push.prefilteredMips = IBL::kPrefilteredMips;
+        const VkExtent2D dispatchExtent = extent;
+        pass.execute = [this, push, dispatchExtent](VkCommandBuffer passCmd) {
+            vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              m_reflectionsPipeline);
+            VkDescriptorSet set = m_bindless->set();
+            vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    m_pipelineLayout, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages, 0,
+                               sizeof(push), &push);
+            vkCmdDispatch(passCmd, (dispatchExtent.width + 7) / 8,
+                          (dispatchExtent.height + 7) / 8, 1);
         };
         graph.addPass(std::move(pass));
     }
@@ -769,6 +1091,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         pass.colorAttachments = {
             {hdr, VK_ATTACHMENT_LOAD_OP_CLEAR, {}, VK_NULL_HANDLE, {}}};
         pass.sampledImages = {gbAlbedo, gbNormal, gbMaterial, depth, shadowMap};
+        if (reflectionsActive) {
+            pass.sampledImages.push_back(rtReflections);
+        }
         LightingPush push{};
         push.frame = frameAddress;
         push.gbAlbedo = slotFor(graph.view(gbAlbedo));
@@ -784,6 +1109,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.iblIntensity = world.settings.iblIntensity;
         push.prefilteredMips = IBL::kPrefilteredMips;
         push.debugView = static_cast<uint32_t>(options.debugView);
+        push.reflectionTexture =
+            reflectionsActive ? slotFor(graph.view(rtReflections)) : 0;
         pass.execute = [this, extent, push](VkCommandBuffer passCmd) {
             setFullViewport(passCmd, extent);
             vkCmdBindPipeline(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -791,9 +1118,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             VkDescriptorSet set = m_bindless->set();
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
-            vkCmdPushConstants(passCmd, m_pipelineLayout,
-                               VK_SHADER_STAGE_VERTEX_BIT |
-                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+            vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                0, sizeof(push), &push);
             vkCmdDraw(passCmd, 3, 1, 0, 0);
         };
@@ -843,9 +1168,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
                                         m_pipelineLayout, 0, 1, &set, 0,
                                         nullptr);
-                vkCmdPushConstants(passCmd, m_pipelineLayout,
-                                   VK_SHADER_STAGE_VERTEX_BIT |
-                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                    0, sizeof(push), &push);
                 vkCmdDraw(passCmd, 3, 1, 0, 0);
             };
@@ -882,9 +1205,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                                         VK_PIPELINE_BIND_POINT_GRAPHICS,
                                         m_pipelineLayout, 0, 1, &set, 0,
                                         nullptr);
-                vkCmdPushConstants(passCmd, m_pipelineLayout,
-                                   VK_SHADER_STAGE_VERTEX_BIT |
-                                       VK_SHADER_STAGE_FRAGMENT_BIT,
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                    0, sizeof(push), &push);
                 vkCmdDraw(passCmd, 3, 1, 0, 0);
             };
@@ -916,9 +1237,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             VkDescriptorSet set = m_bindless->set();
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
-            vkCmdPushConstants(passCmd, m_pipelineLayout,
-                               VK_SHADER_STAGE_VERTEX_BIT |
-                                   VK_SHADER_STAGE_FRAGMENT_BIT,
+            vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
                                0, sizeof(push), &push);
             vkCmdDraw(passCmd, 3, 1, 0, 0);
         };
@@ -1051,6 +1370,10 @@ void Renderer::drawFrame(const Camera& camera, World& world,
 
     VK_CHECK(vkWaitForFences(device, 1, &frame.inFlightFence, VK_TRUE,
                              UINT64_MAX));
+
+    // Safe to write this frame slot's RT buffers now that its fence cleared.
+    m_rtInstanceCount =
+        m_rtSupported ? fillRayTracingInstances(frame, world, assets) : 0;
 
     // The pick recorded in this frame slot has now fully executed.
     if (m_pickPending && m_pickFrameSlot == m_frameIndex) {

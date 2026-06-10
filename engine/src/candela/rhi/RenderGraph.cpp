@@ -165,9 +165,23 @@ void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx) {
         }
         for (Handle handle : pass.sampledImages) {
             barrierTo(cmd, m_resources[handle],
-                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        }
+        for (Handle handle : pass.storageImages) {
+            barrierTo(cmd, m_resources[handle],
+                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                      VK_IMAGE_LAYOUT_GENERAL);
+        }
+
+        // Compute pass: no attachments, no rendering scope.
+        if (pass.colorAttachments.empty() && !pass.depthAttachment) {
+            pass.execute(cmd);
+            continue;
         }
 
         // Dynamic rendering scope from the declared attachments.

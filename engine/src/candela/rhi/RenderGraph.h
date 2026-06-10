@@ -66,6 +66,10 @@ public:
         std::vector<Attachment> colorAttachments;
         std::optional<Attachment> depthAttachment;
         std::vector<Handle> sampledImages;
+        // Written via image store (GENERAL layout). A pass with neither
+        // attachments nor depth runs without a dynamic-rendering scope —
+        // i.e. a compute pass.
+        std::vector<Handle> storageImages;
         std::function<void(VkCommandBuffer)> execute;
     };
 

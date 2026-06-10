@@ -17,7 +17,8 @@ struct LightingPush
     float2 invResolution;
     float iblIntensity;
     uint prefilteredMips;
-    uint debugView; // 0 final, 1 albedo, 2 normals, 3 metal/rough, 4 AO, 5 cascades
+    uint debugView; // 0 final, 1 albedo, 2 normals, 3 metal/rough, 4 AO, 5 cascades, 6 reflections
+    uint reflectionTexture; // RT reflections buffer (when rtFlags has kRTReflections)
 };
 
 [[vk::push_constant]] ConstantBuffer<LightingPush> gPush;
@@ -141,6 +142,32 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float3 V = normalize(frame.cameraPosition.xyz - worldPos);
     float viewDepth = length(frame.cameraPosition.xyz - worldPos);
 
+    // Ray-traced ambient occlusion: short cosine-hemisphere rays, jittered
+    // per pixel with IGN (temporal accumulation arrives with denoising).
+    if ((frame.rtFlags & kRTAmbientOcclusion) != 0)
+    {
+        const uint kAORays = 8;
+        const float kAORange = 0.8;
+        float3x3 basis = orthonormalBasis(N);
+        float rotation = interleavedGradientNoise(uint2(input.position.xy)) *
+                         6.28318530;
+        float visible = 0.0;
+        [unroll]
+        for (uint i = 0; i < kAORays; ++i)
+        {
+            float u1 = (float(i) + 0.5) / float(kAORays);
+            float phi = rotation + 2.39996323 * float(i); // golden angle
+            float cosTheta = sqrt(1.0 - u1);
+            float sinTheta = sqrt(u1);
+            float3 local =
+                float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
+            float3 dir = normalize(mul(local, basis));
+            visible += traceVisibility(gTLAS[frame.tlasSlot],
+                                       worldPos + N * 0.02, dir, kAORange);
+        }
+        occlusion = min(occlusion, visible / float(kAORays));
+    }
+
     // Debug views short-circuit shading.
     if (gPush.debugView != 0)
     {
@@ -165,17 +192,33 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
             };
             return float4(cascadeColors[cascade] * (0.3 + 0.7 * albedo), 1.0);
         }
+        case 6:
+            if ((frame.rtFlags & kRTReflections) != 0)
+                return float4(
+                    gTextures[gPush.reflectionTexture].Sample(uv).rgb, 1.0);
+            return float4(0.0, 0.0, 0.0, 1.0);
         default: break;
         }
     }
 
-    // Sun.
+    // Sun: ray-traced visibility when enabled, cascaded shadow maps as the
+    // fallback.
     float3 L = normalize(frame.sunDirection.xyz);
-    float shadow = sampleShadow(frame, worldPos, viewDepth);
+    float shadow;
+    if ((frame.rtFlags & kRTShadows) != 0)
+    {
+        shadow = traceVisibility(gTLAS[frame.tlasSlot], worldPos + N * 0.02, L,
+                                 10000.0);
+    }
+    else
+    {
+        shadow = sampleShadow(frame, worldPos, viewDepth);
+    }
     float3 direct = brdf(N, V, L, albedo, metallic, roughness) *
                     frame.sunColor.rgb * frame.sunDirection.w * shadow;
 
     // Point lights (inverse-square falloff, windowed at the radius).
+    // RT shadows give point lights occlusion the raster path never had.
     for (uint i = 0; i < frame.pointLightCount; ++i)
     {
         PointLight light = frame.pointLights[i];
@@ -185,11 +228,18 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
         if (distance2 > radius * radius)
             continue;
         float distance = sqrt(distance2);
+        float lightShadow = 1.0;
+        if ((frame.rtFlags & kRTShadows) != 0)
+        {
+            lightShadow = traceVisibility(gTLAS[frame.tlasSlot],
+                                          worldPos + N * 0.02,
+                                          toLight / distance, distance - 0.05);
+        }
         float attenuation = 1.0 / max(distance2, 0.01);
         float window = pow(saturate(1.0 - pow(distance / radius, 4.0)), 2.0);
         direct += brdf(N, V, normalize(toLight), albedo, metallic, roughness) *
                   light.colorIntensity.rgb * light.colorIntensity.w *
-                  attenuation * window;
+                  attenuation * window * lightShadow;
     }
 
     // IBL ambient (split-sum).
@@ -207,6 +257,13 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float lod = roughness * float(gPush.prefilteredMips - 1);
     float3 prefiltered =
         gCubes[gPush.prefilteredCube].SampleLevel(R, lod).rgb;
+    // Ray-traced reflections replace the prefiltered env where traced
+    // (alpha carries confidence; rough surfaces stay on IBL).
+    if ((frame.rtFlags & kRTReflections) != 0)
+    {
+        float4 traced = gTextures[gPush.reflectionTexture].Sample(uv);
+        prefiltered = lerp(prefiltered, traced.rgb, traced.a);
+    }
     float2 envBRDF =
         gTextures[gPush.brdfLut].Sample(float2(NdotV, roughness)).rg;
     float3 specularIBL = prefiltered * (F * envBRDF.x + envBRDF.y);
