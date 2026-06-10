@@ -20,6 +20,7 @@ struct LightingPush
     uint debugView; // 0 final, 1 albedo, 2 normals, 3 metal/rough, 4 AO, 5 cascades, 6 reflections
     uint reflectionTexture; // accumulated RT reflections (kRTReflections)
     uint aoTexture;         // accumulated RT AO (kRTAmbientOcclusion)
+    uint environmentCube;   // Cube binding — sky background
 };
 
 [[vk::push_constant]] ConstantBuffer<LightingPush> gPush;
@@ -123,9 +124,16 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float depth = gTextures[gPush.gbDepth].Sample(uv).r;
     if (depth <= 0.0) // reverse-Z far plane — sky
     {
-        // Sample the environment via the view ray when we add a sky pass;
-        // for now a simple gradient keeps the silhouette readable.
-        return float4(0.10, 0.13, 0.22, 1.0);
+        // View ray through this pixel (any depth works for a direction —
+        // subtract the camera position after unprojecting).
+        float4 farH = mul(frame->invViewProjection,
+                          float4(uvToNDC(uv), 0.5, 1.0));
+        float3 viewDir =
+            normalize(farH.xyz / farH.w - frame->cameraPosition.xyz);
+        float3 sky = gCubes[gPush.environmentCube]
+                         .SampleLevel(viewDir, 0.0)
+                         .rgb;
+        return float4(sky * gPush.iblIntensity, 1.0);
     }
 
     // Reconstruct world position.

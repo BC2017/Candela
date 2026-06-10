@@ -6,6 +6,7 @@
 #include "candela/renderer/Cascades.h"
 #include "candela/scene/World.h"
 
+#include <glm/gtc/matrix_access.hpp>
 #include <stb_image_write.h>
 #include <tracy/Tracy.hpp>
 
@@ -108,7 +109,46 @@ struct LightingPush {
     uint32_t debugView;
     uint32_t reflectionTexture; // accumulated RT reflections (bit 2)
     uint32_t aoTexture;         // accumulated RT AO (bit 1)
+    uint32_t environmentCube;   // sky background
 };
+
+// Gribb–Hartmann frustum planes from a view-projection matrix (Vulkan
+// z∈[0,w]; works for the reverse-Z infinite projection unchanged).
+struct Frustum {
+    glm::vec4 planes[6];
+};
+
+Frustum frustumFromMatrix(const glm::mat4& m) {
+    const glm::vec4 r0 = glm::row(m, 0);
+    const glm::vec4 r1 = glm::row(m, 1);
+    const glm::vec4 r2 = glm::row(m, 2);
+    const glm::vec4 r3 = glm::row(m, 3);
+    return {{r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2}};
+}
+
+bool aabbVisible(const Frustum& frustum, const glm::vec3& boundsMin,
+                 const glm::vec3& boundsMax, const glm::mat4& transform) {
+    glm::vec4 corners[8];
+    for (int i = 0; i < 8; ++i) {
+        corners[i] = transform * glm::vec4((i & 1) ? boundsMax.x : boundsMin.x,
+                                           (i & 2) ? boundsMax.y : boundsMin.y,
+                                           (i & 4) ? boundsMax.z : boundsMin.z,
+                                           1.0f);
+    }
+    for (const glm::vec4& plane : frustum.planes) {
+        bool anyInside = false;
+        for (const glm::vec4& corner : corners) {
+            if (glm::dot(plane, corner) >= 0.0f) {
+                anyInside = true;
+                break;
+            }
+        }
+        if (!anyInside) {
+            return false;
+        }
+    }
+    return true;
+}
 
 struct AOPush {
     VkDeviceAddress frame;
@@ -250,6 +290,8 @@ Renderer::Renderer(Window& window) : m_window(window) {
     m_brdfLutSlot = m_bindless->add(Bindless::Kind::Texture2D,
                                     m_ibl.brdfLut.view,
                                     m_bindless->clampSampler());
+    m_environmentSlot = m_bindless->add(
+        Bindless::Kind::Cube, m_ibl.environment.view, m_bindless->clampSampler());
 
     m_rtSupported = m_context->rayTracingSupported();
     if (m_rtSupported) {
@@ -1215,6 +1257,9 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
             vkCmdBindDescriptorSets(passCmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     m_pipelineLayout, 0, 1, &set, 0, nullptr);
             for (const FrameDraw& draw : m_frameDraws) {
+                if (!draw.visible) {
+                    continue; // frustum-culled
+                }
                 const GpuPrimitive& primitive = *draw.primitive;
                 GBufferPush push{};
                 push.model = draw.transform;
@@ -1356,6 +1401,7 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         push.irradianceCube = m_irradianceSlot;
         push.prefilteredCube = m_prefilteredSlot;
         push.brdfLut = m_brdfLutSlot;
+        push.environmentCube = m_environmentSlot;
         push.invResolution = {1.0f / static_cast<float>(extent.width),
                               1.0f / static_cast<float>(extent.height)};
         push.iblIntensity = world.settings.iblIntensity;
@@ -1678,17 +1724,27 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     m_frameDraws.clear();
     m_frameLights.clear();
     uint32_t triangles = 0;
+    uint32_t culled = 0;
+    const float cullAspect = static_cast<float>(sceneExtent.width) /
+                             static_cast<float>((std::max)(1u, sceneExtent.height));
+    const Frustum frustum =
+        frustumFromMatrix(camera.viewProjection(cullAspect));
     for (auto [entity, transform, mesh] :
          world.registry.view<WorldTransform, MeshRenderer>().each()) {
         const ModelAsset* model = assets.tryGetModel(mesh.model);
         if (model == nullptr || mesh.meshIndex >= model->meshes.size()) {
             continue;
         }
+        const GpuMesh& gpuMesh = model->meshes[mesh.meshIndex];
         const uint32_t entityId = static_cast<uint32_t>(entity) + 1;
-        for (const GpuPrimitive& primitive :
-             model->meshes[mesh.meshIndex].primitives) {
-            m_frameDraws.push_back({transform.value, &primitive, entityId});
-            triangles += primitive.indexCount / 3;
+        for (const GpuPrimitive& primitive : gpuMesh.primitives) {
+            const bool visible =
+                aabbVisible(frustum, primitive.boundsMin, primitive.boundsMax,
+                            transform.value);
+            m_frameDraws.push_back(
+                {transform.value, &primitive, entityId, visible});
+            triangles += visible ? primitive.indexCount / 3 : 0;
+            culled += visible ? 0u : 1u;
         }
     }
     for (auto [entity, transform, light] :
@@ -1697,7 +1753,8 @@ void Renderer::drawFrame(const Camera& camera, World& world,
                                  light.color, light.intensity});
     }
 
-    m_stats.drawCalls = static_cast<uint32_t>(m_frameDraws.size());
+    m_stats.drawCalls = static_cast<uint32_t>(m_frameDraws.size()) - culled;
+    m_stats.culledDraws = culled;
     m_stats.triangles = triangles;
     m_stats.pointLights = static_cast<uint32_t>(m_frameLights.size());
     m_stats.rayTracingSupported = m_rtSupported;
@@ -1721,6 +1778,9 @@ void Renderer::drawFrame(const Camera& camera, World& world,
         m_brdfLutSlot = m_bindless->add(Bindless::Kind::Texture2D,
                                         m_ibl.brdfLut.view,
                                         m_bindless->clampSampler());
+        m_environmentSlot = m_bindless->add(Bindless::Kind::Cube,
+                                            m_ibl.environment.view,
+                                            m_bindless->clampSampler());
         m_iblReady = true;
     }
 

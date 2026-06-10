@@ -217,6 +217,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                     VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | rtUsage);
             gpu.indexCount = static_cast<uint32_t>(indices.size());
             gpu.vertexCount = static_cast<uint32_t>(vertices.size());
+            gpu.boundsMin = primMin;
+            gpu.boundsMax = primMax;
             gpu.albedoTexture = whiteIndex;
             gpu.normalTexture = whiteIndex;
             gpu.metallicRoughnessTexture = whiteIndex;

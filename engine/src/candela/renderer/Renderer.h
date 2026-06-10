@@ -41,6 +41,7 @@ struct GpuPassTiming {
 
 struct RenderStats {
     uint32_t drawCalls = 0; // scene draws per geometry pass
+    uint32_t culledDraws = 0;
     uint32_t triangles = 0;
     uint32_t pointLights = 0;
     uint32_t rtInstances = 0;
@@ -158,6 +159,9 @@ private:
         glm::mat4 transform;
         const GpuPrimitive* primitive;
         uint32_t entityId; // entt id + 1
+        // Inside the camera frustum (G-buffer pass). Shadow passes always
+        // draw — casters behind the camera still shadow what's visible.
+        bool visible = true;
     };
 
     struct FrameLight {
@@ -254,6 +258,7 @@ private:
     uint32_t m_irradianceSlot = 0;
     uint32_t m_prefilteredSlot = 0;
     uint32_t m_brdfLutSlot = 0;
+    uint32_t m_environmentSlot = 0;
 
     std::unordered_map<VkImageView, uint32_t> m_viewSlots;
 

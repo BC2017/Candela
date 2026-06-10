@@ -224,6 +224,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        const candela::RenderStats& stats = renderer.stats();
+        CD_INFO("Final frame: {} draws ({} culled), {:.2f}M tris, "
+                "GPU {:.2f} ms",
+                stats.drawCalls, stats.culledDraws,
+                static_cast<double>(stats.triangles) / 1e6,
+                static_cast<double>(stats.gpuTotalMs));
         CD_INFO("Shutting down after {} frames", frameCount);
     }
 

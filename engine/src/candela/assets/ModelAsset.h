@@ -42,6 +42,10 @@ struct GpuPrimitive {
     float metallicFactor = 1.0f;
     float roughnessFactor = 1.0f;
     glm::vec4 baseColorFactor{1.0f};
+    // Object-space bounds (frustum culling at per-primitive granularity —
+    // big merged meshes like Sponza would otherwise cull all-or-nothing).
+    glm::vec3 boundsMin{0.0f};
+    glm::vec3 boundsMax{0.0f};
 };
 
 struct GpuMesh {
