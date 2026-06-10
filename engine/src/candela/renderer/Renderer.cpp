@@ -36,7 +36,7 @@ struct FrameConstants {
     glm::vec4 sunColor;
     uint32_t pointLightCount;
     uint32_t pad0, pad1, pad2;
-    PointLightGPU pointLights[8];
+    PointLightGPU pointLights[64];
     uint32_t rtFlags; // bit 0 shadows, 1 AO, 2 reflections
     uint32_t tlasSlot;
     uint32_t pad3, pad4;
@@ -49,7 +49,7 @@ struct FrameConstants {
     uint32_t frameIndex;
     uint32_t taaEnabled;
 };
-static_assert(sizeof(FrameConstants) == 896,
+static_assert(sizeof(FrameConstants) == 2688,
               "FrameConstants must match common.slang");
 
 // Per-TLAS-geometry shading data for ray-query hit evaluation.
@@ -1081,7 +1081,7 @@ void Renderer::updateFrameConstants(FrameData& frame, const Camera& camera,
         glm::vec4(glm::normalize(settings.toSun), settings.sunIntensity);
     constants.sunColor = glm::vec4(settings.sunColor, 0.0f);
     constants.pointLightCount =
-        (std::min)(static_cast<uint32_t>(m_frameLights.size()), 8u);
+        (std::min)(static_cast<uint32_t>(m_frameLights.size()), 64u);
     for (uint32_t i = 0; i < constants.pointLightCount; ++i) {
         const FrameLight& light = m_frameLights[i];
         constants.pointLights[i].positionRadius =

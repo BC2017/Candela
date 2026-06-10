@@ -29,6 +29,100 @@ glm::mat4 gizmoProjection(const Camera& camera, float aspect) {
                                  1000.0f);
 }
 
+// Candela's look: charcoal surfaces with a warm candlelight-amber accent.
+void applyCandelaTheme() {
+    ImGuiStyle& style = ImGui::GetStyle();
+
+    style.WindowRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.FrameRounding = 4.0f;
+    style.PopupRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.TabRounding = 5.0f;
+    style.ScrollbarRounding = 10.0f;
+    style.WindowBorderSize = 1.0f;
+    style.FrameBorderSize = 0.0f;
+    style.PopupBorderSize = 1.0f;
+    style.TabBarBorderSize = 2.0f;
+    style.WindowPadding = {10.0f, 10.0f};
+    style.FramePadding = {9.0f, 5.0f};
+    style.ItemSpacing = {8.0f, 6.0f};
+    style.ItemInnerSpacing = {6.0f, 4.0f};
+    style.CellPadding = {6.0f, 4.0f};
+    style.IndentSpacing = 18.0f;
+    style.ScrollbarSize = 12.0f;
+    style.GrabMinSize = 10.0f;
+    style.SeparatorTextBorderSize = 2.0f;
+    style.SeparatorTextPadding = {18.0f, 4.0f};
+    style.DockingSeparatorSize = 3.0f;
+
+    constexpr auto rgb = [](int r, int g, int b, float a = 1.0f) {
+        return ImVec4(static_cast<float>(r) / 255.0f,
+                      static_cast<float>(g) / 255.0f,
+                      static_cast<float>(b) / 255.0f, a);
+    };
+    const ImVec4 amber = rgb(232, 163, 61);
+    const ImVec4 amberDim = rgb(232, 163, 61, 0.55f);
+    const ImVec4 amberBright = rgb(248, 188, 92);
+
+    ImVec4* colors = style.Colors;
+    colors[ImGuiCol_Text] = rgb(222, 222, 220);
+    colors[ImGuiCol_TextDisabled] = rgb(112, 112, 110);
+    colors[ImGuiCol_WindowBg] = rgb(26, 27, 30);
+    colors[ImGuiCol_ChildBg] = rgb(26, 27, 30);
+    colors[ImGuiCol_PopupBg] = rgb(33, 34, 38);
+    colors[ImGuiCol_Border] = rgb(0, 0, 0, 0.45f);
+    colors[ImGuiCol_BorderShadow] = rgb(0, 0, 0, 0.0f);
+    colors[ImGuiCol_FrameBg] = rgb(42, 43, 48);
+    colors[ImGuiCol_FrameBgHovered] = rgb(51, 52, 58);
+    colors[ImGuiCol_FrameBgActive] = rgb(58, 59, 66);
+    colors[ImGuiCol_TitleBg] = rgb(20, 21, 23);
+    colors[ImGuiCol_TitleBgActive] = rgb(20, 21, 23);
+    colors[ImGuiCol_TitleBgCollapsed] = rgb(20, 21, 23);
+    colors[ImGuiCol_MenuBarBg] = rgb(20, 21, 23);
+    colors[ImGuiCol_ScrollbarBg] = rgb(20, 21, 23, 0.6f);
+    colors[ImGuiCol_ScrollbarGrab] = rgb(62, 63, 70);
+    colors[ImGuiCol_ScrollbarGrabHovered] = rgb(76, 77, 85);
+    colors[ImGuiCol_ScrollbarGrabActive] = amberDim;
+    colors[ImGuiCol_CheckMark] = amber;
+    colors[ImGuiCol_SliderGrab] = amberDim;
+    colors[ImGuiCol_SliderGrabActive] = amber;
+    colors[ImGuiCol_Button] = rgb(48, 49, 55);
+    colors[ImGuiCol_ButtonHovered] = rgb(64, 60, 50);
+    colors[ImGuiCol_ButtonActive] = rgb(86, 70, 43);
+    colors[ImGuiCol_Header] = rgb(48, 49, 55);
+    colors[ImGuiCol_HeaderHovered] = rgb(64, 60, 50);
+    colors[ImGuiCol_HeaderActive] = rgb(86, 70, 43);
+    colors[ImGuiCol_Separator] = rgb(0, 0, 0, 0.45f);
+    colors[ImGuiCol_SeparatorHovered] = amberDim;
+    colors[ImGuiCol_SeparatorActive] = amber;
+    colors[ImGuiCol_ResizeGrip] = rgb(62, 63, 70, 0.5f);
+    colors[ImGuiCol_ResizeGripHovered] = amberDim;
+    colors[ImGuiCol_ResizeGripActive] = amber;
+    colors[ImGuiCol_Tab] = rgb(33, 34, 38);
+    colors[ImGuiCol_TabHovered] = rgb(64, 60, 50);
+    colors[ImGuiCol_TabSelected] = rgb(46, 47, 52);
+    colors[ImGuiCol_TabSelectedOverline] = amber;
+    colors[ImGuiCol_TabDimmed] = rgb(26, 27, 30);
+    colors[ImGuiCol_TabDimmedSelected] = rgb(38, 39, 44);
+    colors[ImGuiCol_TabDimmedSelectedOverline] = amberDim;
+    colors[ImGuiCol_DockingPreview] = amberDim;
+    colors[ImGuiCol_DockingEmptyBg] = rgb(15, 16, 18);
+    colors[ImGuiCol_PlotLines] = amber;
+    colors[ImGuiCol_PlotLinesHovered] = amberBright;
+    colors[ImGuiCol_PlotHistogram] = amber;
+    colors[ImGuiCol_PlotHistogramHovered] = amberBright;
+    colors[ImGuiCol_TableHeaderBg] = rgb(33, 34, 38);
+    colors[ImGuiCol_TableBorderStrong] = rgb(0, 0, 0, 0.5f);
+    colors[ImGuiCol_TableBorderLight] = rgb(0, 0, 0, 0.25f);
+    colors[ImGuiCol_TableRowBg] = rgb(255, 255, 255, 0.0f);
+    colors[ImGuiCol_TableRowBgAlt] = rgb(255, 255, 255, 0.03f);
+    colors[ImGuiCol_TextSelectedBg] = rgb(232, 163, 61, 0.30f);
+    colors[ImGuiCol_DragDropTarget] = amber;
+    colors[ImGuiCol_NavCursor] = amber;
+    colors[ImGuiCol_ModalWindowDimBg] = rgb(10, 10, 12, 0.6f);
+}
+
 } // namespace
 
 EditorApp::EditorApp(Window& window, Renderer& renderer, AssetRegistry& assets,
@@ -47,7 +141,13 @@ EditorApp::EditorApp(Window& window, Renderer& renderer, AssetRegistry& assets,
     // The engine manages cursor capture for mouse-look; stop the backend
     // from fighting it.
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-    ImGui::StyleColorsDark();
+
+    const std::filesystem::path fontPath =
+        std::filesystem::path(CANDELA_IMGUI_FONT_DIR) / "Roboto-Medium.ttf";
+    if (std::filesystem::exists(fontPath)) {
+        io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 17.0f);
+    }
+    applyCandelaTheme();
 
     ImGui_ImplGlfw_InitForVulkan(window.handle(), true);
 
@@ -289,12 +389,29 @@ void EditorApp::drawMenuBar(World& world) {
         ImGui::MenuItem("Light Gizmos", nullptr, &m_showLightGizmos);
         ImGui::EndMenu();
     }
-    if (m_playing ? ImGui::MenuItem("[ Stop ]") : ImGui::MenuItem("[ Play ]")) {
-        m_playing ? stopPlay(world) : startPlay(world);
+    // Play/Stop as an amber-accented button, with the scene name centered.
+    {
+        const char* label = m_playing ? "  Stop  " : "  Play  ";
+        if (m_playing) {
+            ImGui::PushStyleColor(ImGuiCol_Button,
+                                  ImVec4(0.91f, 0.64f, 0.24f, 0.85f));
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                                  ImVec4(0.10f, 0.09f, 0.07f, 1.0f));
+        }
+        if (ImGui::SmallButton(label)) {
+            m_playing ? stopPlay(world) : startPlay(world);
+        }
+        if (m_playing) {
+            ImGui::PopStyleColor(2);
+        }
+
+        const std::string scene = m_scenePath.filename().string() +
+                                  (m_playing ? "  (playing)" : "");
+        const float center = (ImGui::GetWindowWidth() -
+                              ImGui::CalcTextSize(scene.c_str()).x) * 0.5f;
+        ImGui::SetCursorPosX((std::max)(center, ImGui::GetCursorPosX()));
+        ImGui::TextDisabled("%s", scene.c_str());
     }
-    ImGui::Separator();
-    ImGui::TextDisabled("%s%s", m_scenePath.filename().string().c_str(),
-                        m_playing ? "  (playing)" : "");
     ImGui::EndMainMenuBar();
 }
 
@@ -336,6 +453,40 @@ void EditorApp::drawViewport(World& world) {
                                           guid, m_assets));
         }
         ImGui::EndDragDropTarget();
+    }
+
+    // Floating gizmo-mode toolbar over the viewport's top-left corner.
+    if (!m_playing) {
+        ImGui::SetNextWindowPos({imagePos.x + 10.0f, imagePos.y + 10.0f});
+        ImGui::SetNextWindowBgAlpha(0.70f);
+        const ImGuiWindowFlags overlayFlags =
+            ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings |
+            ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+        if (ImGui::Begin("##gizmo-toolbar", nullptr, overlayFlags)) {
+            const auto modeButton = [&](const char* label, int op) {
+                const bool active = m_gizmoOperation == op;
+                if (active) {
+                    ImGui::PushStyleColor(ImGuiCol_Button,
+                                          ImVec4(0.91f, 0.64f, 0.24f, 0.85f));
+                    ImGui::PushStyleColor(ImGuiCol_Text,
+                                          ImVec4(0.10f, 0.09f, 0.07f, 1.0f));
+                }
+                if (ImGui::SmallButton(label)) {
+                    m_gizmoOperation = op;
+                }
+                if (active) {
+                    ImGui::PopStyleColor(2);
+                }
+            };
+            modeButton("Move", 0);
+            ImGui::SameLine();
+            modeButton("Rotate", 1);
+            ImGui::SameLine();
+            modeButton("Scale", 2);
+        }
+        ImGui::End();
     }
 
     // Gizmo for the selected entity.
