@@ -57,7 +57,19 @@ FetchContent_Declare(stb
   GIT_TAG master
   GIT_SHALLOW ON)
 
-FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb)
+FetchContent_Declare(entt
+  GIT_REPOSITORY https://github.com/skypjack/entt.git
+  GIT_TAG v3.13.2
+  GIT_SHALLOW ON)
+
+set(JSON_BuildTests OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(nlohmann_json
+  GIT_REPOSITORY https://github.com/nlohmann/json.git
+  GIT_TAG v3.11.3
+  GIT_SHALLOW ON)
+
+FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb
+                           entt nlohmann_json)
 
 # stb has no CMake build — expose it as an interface include target.
 add_library(stb INTERFACE)

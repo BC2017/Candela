@@ -1,16 +1,16 @@
 #include "candela/renderer/Camera.h"
 
+#include "candela/platform/Input.h"
 #include "candela/platform/Window.h"
 
-#include <GLFW/glfw3.h>
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
 
 namespace candela {
 
-void Camera::update(Window& window, float dt) {
-    const bool looking = window.isMouseButtonDown(GLFW_MOUSE_BUTTON_RIGHT);
+void Camera::update(Window& window, const InputActions& input, float dt) {
+    const bool looking = input.isDown(window, "look");
     window.setCursorCaptured(looking);
 
     const glm::vec2 mouseDelta = window.consumeMouseDelta();
@@ -25,18 +25,13 @@ void Camera::update(Window& window, float dt) {
     const glm::vec3 right =
         glm::normalize(glm::cross(fwd, glm::vec3(0.0f, 1.0f, 0.0f)));
 
-    glm::vec3 move{0.0f};
-    if (window.isKeyDown(GLFW_KEY_W)) move += fwd;
-    if (window.isKeyDown(GLFW_KEY_S)) move -= fwd;
-    if (window.isKeyDown(GLFW_KEY_D)) move += right;
-    if (window.isKeyDown(GLFW_KEY_A)) move -= right;
-    if (window.isKeyDown(GLFW_KEY_E)) move.y += 1.0f;
-    if (window.isKeyDown(GLFW_KEY_Q)) move.y -= 1.0f;
+    glm::vec3 move = fwd * input.axis(window, "move_forward", "move_back") +
+                     right * input.axis(window, "move_right", "move_left");
+    move.y += input.axis(window, "move_up", "move_down");
 
     if (glm::dot(move, move) > 0.0f) {
-        const float speed = window.isKeyDown(GLFW_KEY_LEFT_SHIFT)
-                                ? moveSpeed * 4.0f
-                                : moveSpeed;
+        const float speed =
+            input.isDown(window, "sprint") ? moveSpeed * 4.0f : moveSpeed;
         position += glm::normalize(move) * speed * dt;
     }
 }

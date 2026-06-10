@@ -8,6 +8,7 @@ CD_PUSH_DISABLE_WARNINGS
 CD_POP_WARNINGS
 
 #include <functional>
+#include <mutex>
 #include <string>
 
 namespace candela {
@@ -36,12 +37,19 @@ public:
     void waitIdle() const;
 
     // Records, submits, and waits on the graphics queue. For uploads and
-    // one-off GPU work; not for per-frame use.
+    // one-off GPU work; not for per-frame use. Thread-safe: callers serialize
+    // on an internal mutex, so asset imports may run on job threads.
+    // NOTE: the per-frame submit in Renderer stays main-thread only.
     void immediateSubmit(const std::function<void(VkCommandBuffer)>& record) const;
 
     // Command buffer backing immediateSubmit; in the initial state between
     // calls (Tracy's GPU context init wants exactly that).
     VkCommandBuffer immediateCommandBuffer() const { return m_immediateCmd; }
+
+    // VkQueue access requires external synchronization across ALL submitters.
+    // immediateSubmit and waitIdle lock this internally; the renderer must
+    // hold it around its per-frame vkQueueSubmit2/vkQueuePresentKHR.
+    std::mutex& queueMutex() const { return m_immediateMutex; }
 
 private:
     VkInstance m_instance = VK_NULL_HANDLE;
@@ -55,6 +63,7 @@ private:
     VkCommandPool m_immediatePool = VK_NULL_HANDLE;
     VkCommandBuffer m_immediateCmd = VK_NULL_HANDLE;
     VkFence m_immediateFence = VK_NULL_HANDLE;
+    mutable std::mutex m_immediateMutex;
     std::string m_gpuName;
 };
 

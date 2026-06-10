@@ -72,11 +72,14 @@ Edit `shaders/fullscreen.slang` while the sandbox runs to see shader hot reload.
 
 ## Status
 
-**Phase 2 complete** — deferred PBR pipeline, fully render-graph driven:
+**Phase 3 complete** — Candela is now an engine, not a renderer demo:
+EnTT ECS (transform hierarchy, mesh renderers, lights, per-scene settings in registry context) with the renderer consuming the registry each frame; an asset registry that stamps sources with GUID `.meta` files, imports glTF models **asynchronously on a job system** (geometry streams in while the app runs — Sponza pops in ~1.5 s after the window appears), and re-imports automatically when source files change; `.candela` JSON scene serialization with a byte-identical save→load→save round-trip (`--roundtrip-check`); a typed event bus (asset-reloaded events); and input-action mapping replacing hardcoded keys. All GPU submission paths are mutex-serialized so imports run safely on worker threads.
+
+**Phase 2** — deferred PBR pipeline, fully render-graph driven:
 4 shadow cascades (texel-snapped, PCF) → G-buffer (albedo / octahedral normals / metallic-roughness-AO) → Cook-Torrance GGX lighting with sun + point lights and split-sum IBL (GPU-precomputed irradiance, GGX-prefiltered specular, BRDF LUT from a Poly Haven HDRI) → dual-Kawase bloom → ACES tonemap. Full glTF material loading: normal mapping with tangents, metallic-roughness, occlusion, sRGB-aware texture cache. Sponza renders validation-clean at ~550 fps (debug, 1600×900, RTX 5080); all shaders hot-reload as a group.
 
 Run `scripts\get-assets.ps1` once to download the Sponza test scene and HDRI.
 
 Deferred to later phases: emissive + velocity G-buffer targets (TAA/denoising), sky rendering from the environment cube, alpha-tested shadows, IBL disk caching, KTX2/BC texture compression (Phase 3 asset pipeline). Phase 1: render graph, bindless, glTF. Phase 0: Vulkan bring-up, Slang hot reload.
 
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 3 (ECS, asset system, scene serialization).
+See [docs/ROADMAP.md](docs/ROADMAP.md) for the phased build plan. Next: Phase 4 (Candela Studio — the editor).
