@@ -15,7 +15,7 @@
 
 int main(int argc, char** argv) {
     candela::Log::init();
-    CD_INFO("Candela sandbox — Phase 1");
+    CD_INFO("Candela sandbox — Phase 2");
 
     // --frames N: exit after N frames (used by automated verification).
     uint64_t maxFrames = 0;
@@ -45,6 +45,22 @@ int main(int argc, char** argv) {
     camera.position = {-7.0f, 1.8f, -0.5f};
     camera.yawRadians = glm::radians(-90.0f);
 
+    // Sun angled to fall through Sponza's atrium opening, plus warm fill
+    // lights along the colonnade.
+    candela::LightSetup lights;
+    lights.toSun = glm::normalize(glm::vec3(0.25f, 1.0f, 0.12f));
+    lights.sunIntensity = 6.0f;
+    lights.sunColor = {1.0f, 0.96f, 0.88f};
+    lights.iblIntensity = 0.8f;
+    lights.exposure = 1.0f;
+    lights.bloomStrength = 0.05f;
+    lights.pointLights = {
+        {{-9.5f, 1.6f, 1.2f}, 8.0f, {1.0f, 0.55f, 0.25f}, 2.5f},
+        {{-9.5f, 1.6f, -1.8f}, 8.0f, {1.0f, 0.55f, 0.25f}, 2.5f},
+        {{9.0f, 1.6f, 1.2f}, 8.0f, {0.3f, 0.55f, 1.0f}, 2.5f},
+        {{9.0f, 1.6f, -1.8f}, 8.0f, {0.3f, 0.55f, 1.0f}, 2.5f},
+    };
+
     uint64_t frameCount = 0;
     uint32_t framesThisSecond = 0;
     auto lastTitleUpdate = std::chrono::steady_clock::now();
@@ -59,7 +75,7 @@ int main(int argc, char** argv) {
         lastFrameTime = now;
 
         camera.update(window, dt);
-        renderer.drawFrame(camera);
+        renderer.drawFrame(camera, lights);
         FrameMark;
 
         ++frameCount;
@@ -67,7 +83,7 @@ int main(int argc, char** argv) {
         if (now - lastTitleUpdate >= std::chrono::seconds(1)) {
             const float ms = 1000.0f / static_cast<float>(framesThisSecond);
             window.setTitle(std::format(
-                "Candela — Phase 1 | {:.2f} ms ({} fps) | RMB look, WASD move",
+                "Candela — Phase 2 | {:.2f} ms ({} fps) | RMB look, WASD move",
                 ms, framesThisSecond));
             framesThisSecond = 0;
             lastTitleUpdate = now;

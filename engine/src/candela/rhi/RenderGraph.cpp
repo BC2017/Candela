@@ -15,23 +15,38 @@ RenderGraph::~RenderGraph() {
 void RenderGraph::begin() {
     m_resources.clear();
     m_passes.clear();
+    ++m_frameNumber;
+
+    // Drop pooled images that have gone unused (e.g. pre-resize sizes).
+    constexpr uint64_t kEvictAfterFrames = 120;
+    std::erase_if(m_pool, [&](PooledImage& pooled) {
+        if (!pooled.inUse &&
+            m_frameNumber - pooled.lastUsedFrame > kEvictAfterFrames) {
+            destroyImage(m_context, pooled.image);
+            return true;
+        }
+        return false;
+    });
     for (PooledImage& pooled : m_pool) {
         pooled.inUse = false;
     }
-    ++m_frameNumber;
 }
 
 RenderGraph::Handle RenderGraph::importImage(std::string name, VkImage image,
                                              VkImageView view, VkFormat format,
                                              VkExtent2D extent,
-                                             VkImageLayout currentLayout) {
+                                             VkImageLayout currentLayout,
+                                             VkPipelineStageFlags2 lastStage,
+                                             VkAccessFlags2 lastAccess,
+                                             bool isDepth) {
     Resource resource;
     resource.name = std::move(name);
     resource.image = image;
     resource.view = view;
     resource.format = format;
     resource.extent = extent;
-    resource.state.layout = currentLayout;
+    resource.isDepth = isDepth;
+    resource.state = {lastStage, lastAccess, currentLayout};
     m_resources.push_back(std::move(resource));
     return static_cast<Handle>(m_resources.size() - 1);
 }
@@ -159,30 +174,37 @@ void RenderGraph::execute(VkCommandBuffer cmd, TracyVkCtx tracyCtx) {
         std::vector<VkRenderingAttachmentInfo> colorInfos;
         colorInfos.reserve(pass.colorAttachments.size());
         VkExtent2D renderArea{};
+        auto attachmentView = [&](const Attachment& attachment) {
+            return attachment.viewOverride != VK_NULL_HANDLE
+                       ? attachment.viewOverride
+                       : m_resources[attachment.handle].view;
+        };
+        auto attachmentExtent = [&](const Attachment& attachment) {
+            return attachment.extentOverride.width != 0
+                       ? attachment.extentOverride
+                       : m_resources[attachment.handle].extent;
+        };
         for (const Attachment& attachment : pass.colorAttachments) {
-            const Resource& resource = m_resources[attachment.handle];
             VkRenderingAttachmentInfo info{};
             info.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            info.imageView = resource.view;
+            info.imageView = attachmentView(attachment);
             info.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             info.loadOp = attachment.loadOp;
             info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             info.clearValue = attachment.clear;
             colorInfos.push_back(info);
-            renderArea = resource.extent;
+            renderArea = attachmentExtent(attachment);
         }
 
         VkRenderingAttachmentInfo depthInfo{};
         if (pass.depthAttachment) {
-            const Resource& resource =
-                m_resources[pass.depthAttachment->handle];
             depthInfo.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            depthInfo.imageView = resource.view;
+            depthInfo.imageView = attachmentView(*pass.depthAttachment);
             depthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
             depthInfo.loadOp = pass.depthAttachment->loadOp;
             depthInfo.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             depthInfo.clearValue = pass.depthAttachment->clear;
-            renderArea = resource.extent;
+            renderArea = attachmentExtent(*pass.depthAttachment);
         }
 
         VkRenderingInfo renderingInfo{};

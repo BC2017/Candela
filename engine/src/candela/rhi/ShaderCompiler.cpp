@@ -49,11 +49,13 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
     // std::system goes through cmd.exe; the outer quotes make cmd preserve the
     // quoting of the individual paths.
     // Column-major matrix layout so GLM matrices upload without transposes.
+    // -I the source's directory so shaders can #include "common.slang".
     const std::string command =
         "\"\"" + m_slangc.string() + "\" \"" + sourcePath.string() +
         "\" -entry " + entry + " -stage " + stageName(stage) +
-        " -target spirv -matrix-layout-column-major -o \"" +
-        spvPath.string() + "\" 2> \"" + errPath.string() + "\"\"";
+        " -target spirv -matrix-layout-column-major -I \"" +
+        sourcePath.parent_path().string() + "\" -o \"" + spvPath.string() +
+        "\" 2> \"" + errPath.string() + "\"\"";
 
     const int exitCode = std::system(command.c_str());
     if (exitCode != 0) {
@@ -107,6 +109,12 @@ void ShaderCache::releaseModule(uint64_t hash) {
     if (--it->second.second == 0) {
         vkDestroyShaderModule(m_device, it->second.first, nullptr);
         m_modules.erase(it);
+    }
+}
+
+void ShaderCache::invalidateAll() {
+    for (auto& [key, entry] : m_entries) {
+        entry.sourceTime = {};
     }
 }
 

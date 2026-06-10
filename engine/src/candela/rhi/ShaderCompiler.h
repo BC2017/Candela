@@ -49,6 +49,11 @@ public:
     VkShaderModule get(const std::filesystem::path& sourcePath,
                        const std::string& entry, ShaderStage stage);
 
+    // Forces recompilation on the next get() for every entry. Used by hot
+    // reload, where an edited #include can affect any shader. Modules whose
+    // SPIR-V is unchanged are kept via the hash table.
+    void invalidateAll();
+
 private:
     struct Entry {
         uint64_t spirvHash = 0;
