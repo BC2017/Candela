@@ -4,6 +4,7 @@ out/
 assets/
 .vs/
 .vscode/
+.idea/
 .cache/
 *.user
 imgui.ini
