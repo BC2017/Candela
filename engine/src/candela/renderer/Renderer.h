@@ -21,10 +21,30 @@ class Camera;
 class World;
 class AssetRegistry;
 
-// Deferred PBR through the render graph — 4 shadow cascades → G-buffer →
-// Cook-Torrance + IBL lighting → dual-Kawase bloom → ACES tonemap. Draws,
-// lights, and scene settings come from the ECS world; geometry referenced by
-// MeshRenderers streams in as the asset registry finishes imports.
+// Renderer debug views (lighting-pass output switch).
+enum class DebugView : uint32_t {
+    Final = 0,
+    Albedo = 1,
+    Normals = 2,
+    MetallicRoughness = 3,
+    Occlusion = 4,
+    Cascades = 5,
+};
+
+// Editor-facing per-frame options. With viewportExtent set, the scene renders
+// into a persistent offscreen image (shown by the editor's viewport panel)
+// and the swapchain receives only the UI pass.
+struct RenderOptions {
+    VkExtent2D viewportExtent{0, 0}; // 0 = render scene directly to backbuffer
+    std::function<void(VkCommandBuffer)> recordUI; // drawn into the backbuffer
+    std::optional<glm::ivec2> pickPixel; // viewport-relative; result polls later
+    DebugView debugView = DebugView::Final;
+};
+
+// Deferred PBR through the render graph — 4 shadow cascades → G-buffer
+// (+ entity-ID target) → Cook-Torrance + IBL lighting → dual-Kawase bloom →
+// ACES tonemap. Draws, lights, and scene settings come from the ECS world;
+// geometry referenced by MeshRenderers streams in as imports finish.
 class Renderer {
 public:
     explicit Renderer(Window& window);
@@ -33,10 +53,29 @@ public:
     Renderer(const Renderer&) = delete;
     Renderer& operator=(const Renderer&) = delete;
 
-    void drawFrame(const Camera& camera, World& world, AssetRegistry& assets);
+    void drawFrame(const Camera& camera, World& world, AssetRegistry& assets,
+                   const RenderOptions& options);
+    void drawFrame(const Camera& camera, World& world, AssetRegistry& assets) {
+        drawFrame(camera, world, assets, RenderOptions{});
+    }
+
+    // Offscreen viewport image (valid after the first editor-mode frame).
+    // The generation counter bumps when the image is recreated (resize) so
+    // the editor can re-register its ImGui texture.
+    VkImageView viewportImageView() const { return m_viewportImage.view; }
+    VkExtent2D viewportImageExtent() const { return m_viewportImage.extent; }
+    uint64_t viewportGeneration() const { return m_viewportGeneration; }
+
+    // Entity-ID readback from a previous pickPixel request: 0 = none/miss,
+    // otherwise entt id + 1. Ready once that frame's fence has recycled.
+    std::optional<uint32_t> takePickResult();
 
     Context& context() { return *m_context; }
     Bindless& bindless() { return *m_bindless; }
+
+    // For the editor's ImGui Vulkan backend setup.
+    VkFormat swapchainFormat() const { return m_swapchain->format(); }
+    uint32_t swapchainImageCount() const { return m_swapchain->imageCount(); }
 
 private:
     static constexpr uint32_t kFramesInFlight = 2;
@@ -79,6 +118,7 @@ private:
     struct FrameDraw {
         glm::mat4 transform;
         const GpuPrimitive* primitive;
+        uint32_t entityId; // entt id + 1
     };
 
     struct FrameLight {
@@ -93,10 +133,12 @@ private:
 
     void recreateSwapchain();
     void checkShaderHotReload();
+    void ensureViewportImage(VkExtent2D extent);
     void updateFrameConstants(FrameData& frame, const Camera& camera,
                               const World& world, float aspect);
     void recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
-                        const Camera& camera, const World& world);
+                        const Camera& camera, const World& world,
+                        const RenderOptions& options);
 
     // Stable bindless slot for a (typically transient) image view, sampled
     // with the clamp sampler. Slots are appended, never freed — acceptable
@@ -136,6 +178,20 @@ private:
 
     std::vector<FrameDraw> m_frameDraws;
     std::vector<FrameLight> m_frameLights;
+
+    // Editor offscreen viewport (persistent — ImGui's descriptor references
+    // it across frames).
+    GpuImage m_viewportImage;
+    uint64_t m_viewportGeneration = 0;
+    bool m_viewportEverRendered = false;
+
+    // One in-flight pick: 4-byte host-visible readback buffer.
+    GpuBuffer m_pickBuffer;
+    void* m_pickMapped = nullptr;
+    uint32_t m_pickFrameSlot = UINT32_MAX; // frame slot that recorded the copy
+    bool m_pickPending = false;
+    std::optional<uint32_t> m_pickResult;
+
     TracyVkCtx m_tracyCtx = nullptr;
 
     std::filesystem::path m_shaderDir;

@@ -17,6 +17,7 @@ struct LightingPush
     float2 invResolution;
     float iblIntensity;
     uint prefilteredMips;
+    uint debugView; // 0 final, 1 albedo, 2 normals, 3 metal/rough, 4 AO, 5 cascades
 };
 
 [[vk::push_constant]] ConstantBuffer<LightingPush> gPush;
@@ -139,6 +140,34 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
 
     float3 V = normalize(frame.cameraPosition.xyz - worldPos);
     float viewDepth = length(frame.cameraPosition.xyz - worldPos);
+
+    // Debug views short-circuit shading.
+    if (gPush.debugView != 0)
+    {
+        switch (gPush.debugView)
+        {
+        case 1: return float4(albedo, 1.0);
+        case 2: return float4(N * 0.5 + 0.5, 1.0);
+        case 3: return float4(metallic, roughness, 0.0, 1.0);
+        case 4: return float4(occlusion, occlusion, occlusion, 1.0);
+        case 5:
+        {
+            int cascade = 3;
+            [unroll]
+            for (int i = 3; i >= 0; --i)
+            {
+                if (viewDepth <= frame.cascadeSplits[i])
+                    cascade = i;
+            }
+            static const float3 cascadeColors[4] = {
+                float3(0.2, 1.0, 0.2), float3(1.0, 1.0, 0.2),
+                float3(1.0, 0.5, 0.2), float3(1.0, 0.2, 0.2)
+            };
+            return float4(cascadeColors[cascade] * (0.3 + 0.7 * albedo), 1.0);
+        }
+        default: break;
+        }
+    }
 
     // Sun.
     float3 L = normalize(frame.sunDirection.xyz);

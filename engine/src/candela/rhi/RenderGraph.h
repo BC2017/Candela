@@ -77,6 +77,7 @@ public:
 
     // Default view of a graph resource (for bindless registration).
     VkImageView view(Handle handle) const { return m_resources[handle].view; }
+    VkImage image(Handle handle) const { return m_resources[handle].image; }
 
     // Records barriers, dynamic rendering scopes, and pass bodies.
     // tracyCtx may be null.

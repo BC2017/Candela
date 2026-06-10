@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace candela {
 
@@ -19,6 +20,11 @@ bool save(const World& world, const std::filesystem::path& path);
 // imports complete.
 bool load(World& world, AssetRegistry& assets,
           const std::filesystem::path& path);
+
+// In-memory variants (editor play-mode snapshots).
+std::string saveToString(const World& world);
+bool loadFromString(World& world, AssetRegistry& assets,
+                    const std::string& text);
 
 } // namespace SceneSerializer
 
