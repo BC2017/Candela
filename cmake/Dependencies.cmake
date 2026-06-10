@@ -85,6 +85,10 @@ FetchContent_Declare(imguizmo
 FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb
                            entt nlohmann_json imgui imguizmo)
 
+# Without an installed SDK (CI), volk has no vulkan.h on its include path —
+# point every consumer at the Vulkan::Headers target explicitly.
+target_link_libraries(volk PUBLIC Vulkan::Headers)
+
 # Dear ImGui has no CMake build — wrap the core plus the GLFW + Vulkan
 # (dynamic rendering, volk) backends in a static lib. ImGuizmo rides along.
 add_library(candela_imgui STATIC
