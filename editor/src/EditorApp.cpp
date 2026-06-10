@@ -348,6 +348,36 @@ void EditorApp::drawMenuBar(World& world) {
             }
             ImGui::EndMenu();
         }
+        // .blend sources discovered in the content directory open as a fresh
+        // scene: reset the world (New Scene semantics), then instantiate the
+        // converted model hierarchy. The first import runs Blender headless,
+        // so it can take a while.
+        if (ImGui::BeginMenu("Import Blender Scene", !m_playing)) {
+            auto blends = m_assets.allAssets();
+            std::erase_if(blends, [](const auto& asset) {
+                return asset.second.extension() != ".blend";
+            });
+            std::sort(blends.begin(), blends.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second.filename() < b.second.filename();
+                      });
+            for (const auto& [guid, path] : blends) {
+                if (ImGui::MenuItem(path.filename().string().c_str())) {
+                    world.registry.clear();
+                    world.settings = {};
+                    m_commands.clear();
+                    m_selected = 0;
+                    world.instantiateModel(m_assets, guid);
+                    assignEditorIds(world);
+                    m_scenePath = m_assetDir / "scenes" /
+                                  (path.stem().string() + ".candela");
+                }
+            }
+            if (blends.empty()) {
+                ImGui::TextDisabled("No .blend files in content");
+            }
+            ImGui::EndMenu();
+        }
         if (ImGui::MenuItem("Save Scene", "Ctrl+S", false, !m_playing)) {
             saveScene(world);
         }

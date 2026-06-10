@@ -1,5 +1,6 @@
 add_library(candela STATIC
     src/candela/assets/AssetRegistry.cpp
+    src/candela/assets/BlendImporter.cpp
     src/candela/assets/ModelAsset.cpp
     src/candela/assets/StbUsage.cpp
     src/candela/core/Jobs.cpp
