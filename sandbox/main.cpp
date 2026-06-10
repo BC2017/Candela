@@ -72,6 +72,7 @@ int main(int argc, char** argv) {
     std::filesystem::path screenshotPath;
     std::filesystem::path modelPath; // view a single model instead of a scene
     bool noRT = false;               // isolate raster path (debugging aid)
+    std::filesystem::path flythroughDir; // capture a camera-path PNG sequence
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -83,6 +84,8 @@ int main(int argc, char** argv) {
             modelPath = argv[i + 1];
         } else if (std::strcmp(argv[i], "--no-rt") == 0) {
             noRT = true;
+        } else if (std::strcmp(argv[i], "--flythrough") == 0 && i + 1 < argc) {
+            flythroughDir = argv[i + 1];
         }
     }
 
@@ -179,6 +182,33 @@ int main(int argc, char** argv) {
         const candela::InputActions input =
             candela::InputActions::flyCameraDefaults();
 
+        // Flythrough: Catmull-Rom path down the Sponza atrium at a fixed
+        // 60 Hz timestep, one PNG per frame after a warmup for asset
+        // streaming and temporal convergence.
+        constexpr uint64_t kFlythroughWarmup = 900;
+        constexpr uint64_t kFlythroughFrames = 720; // 12 s at 60 fps
+        const glm::vec3 flyPoints[] = {
+            {-9.5f, 1.6f, -0.3f}, {-8.5f, 1.6f, -0.2f}, {-4.0f, 2.6f, 0.8f},
+            {1.5f, 1.5f, -0.8f},  {6.5f, 2.1f, 0.3f},   {8.5f, 2.4f, 0.0f},
+        };
+        auto catmullRom = [&](float t) {
+            const int segments = static_cast<int>(std::size(flyPoints)) - 3;
+            const float scaled = t * static_cast<float>(segments);
+            const int seg = (std::min)(static_cast<int>(scaled), segments - 1);
+            const float u = scaled - static_cast<float>(seg);
+            const glm::vec3 p0 = flyPoints[seg];
+            const glm::vec3 p1 = flyPoints[seg + 1];
+            const glm::vec3 p2 = flyPoints[seg + 2];
+            const glm::vec3 p3 = flyPoints[seg + 3];
+            return 0.5f * ((2.0f * p1) + (-p0 + p2) * u +
+                           (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * u * u +
+                           (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * u * u * u);
+        };
+        if (!flythroughDir.empty()) {
+            std::filesystem::create_directories(flythroughDir);
+            maxFrames = kFlythroughWarmup + kFlythroughFrames;
+        }
+
         uint64_t frameCount = 0;
         uint32_t framesThisSecond = 0;
         auto lastTitleUpdate = std::chrono::steady_clock::now();
@@ -193,7 +223,32 @@ int main(int argc, char** argv) {
             lastFrameTime = now;
 
             assets.update();
-            camera.update(window, input, dt);
+            if (flythroughDir.empty()) {
+                camera.update(window, input, dt);
+            } else if (frameCount >= kFlythroughWarmup) {
+                // Drive the camera along the spline, looking down the
+                // smoothed tangent.
+                const uint64_t frame = frameCount - kFlythroughWarmup;
+                const float t = static_cast<float>(frame) /
+                                static_cast<float>(kFlythroughFrames - 1);
+                const glm::vec3 position = catmullRom(t);
+                const glm::vec3 ahead =
+                    catmullRom((std::min)(t + 0.04f, 1.0f) ) ;
+                const glm::vec3 dir = glm::normalize(
+                    ahead - position + glm::vec3(1e-5f, 0.0f, 0.0f));
+                camera.position = position;
+                camera.pitchRadians = std::asin(glm::clamp(dir.y, -1.0f, 1.0f));
+                camera.yawRadians = std::atan2(-dir.x, -dir.z);
+                char name[32];
+                std::snprintf(name, sizeof(name), "frame_%05llu.png",
+                              static_cast<unsigned long long>(frame));
+                renderer.requestScreenshot(flythroughDir / name);
+            } else {
+                // Warmup parked at the path start so history converges there.
+                camera.position = flyPoints[1];
+                camera.yawRadians = glm::radians(-90.0f);
+                camera.pitchRadians = 0.0f;
+            }
             world.updateTransforms();
 
             // Capture late so async assets and temporal accumulation settle.

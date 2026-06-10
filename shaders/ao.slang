@@ -57,8 +57,8 @@ void csMain(uint3 id : SV_DispatchThreadID)
         float3 local =
             float3(cos(phi) * sinTheta, sin(phi) * sinTheta, cosTheta);
         float3 dir = normalize(mul(local, basis));
-        visible += traceVisibility(gTLAS[frame.tlasSlot], worldPos + N * 0.02,
-                                   dir, kRange);
+        visible += traceVisibility(gTLAS[frame.tlasSlot], frame.instanceData,
+                                   worldPos + N * 0.02, dir, kRange);
     }
     gStorageImages[gPush.outputImage][id.xy] =
         float4(visible / float(kRays), 0.0, 0.0, 1.0);

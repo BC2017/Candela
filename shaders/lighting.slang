@@ -198,8 +198,8 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float shadow;
     if ((frame.rtFlags & kRTShadows) != 0)
     {
-        shadow = traceVisibility(gTLAS[frame.tlasSlot], worldPos + N * 0.02, L,
-                                 10000.0);
+        shadow = traceVisibility(gTLAS[frame.tlasSlot], frame.instanceData,
+                                 worldPos + N * 0.02, L, 10000.0);
     }
     else
     {
@@ -222,9 +222,9 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
         float lightShadow = 1.0;
         if ((frame.rtFlags & kRTShadows) != 0)
         {
-            lightShadow = traceVisibility(gTLAS[frame.tlasSlot],
-                                          worldPos + N * 0.02,
-                                          toLight / distance, distance - 0.05);
+            lightShadow = traceVisibility(
+                gTLAS[frame.tlasSlot], frame.instanceData, worldPos + N * 0.02,
+                toLight / distance, distance - 0.05);
         }
         float attenuation = 1.0 / max(distance2, 0.01);
         float window = pow(saturate(1.0 - pow(distance / radius, 4.0)), 2.0);

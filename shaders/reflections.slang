@@ -127,6 +127,7 @@ void csMain(uint3 id : SV_DispatchThreadID)
         if (ndotl > 0.0)
         {
             visibility = traceVisibility(gTLAS[frame.tlasSlot],
+                                         frame.instanceData,
                                          hitPos + hitNormal * 0.02, L,
                                          10000.0);
         }

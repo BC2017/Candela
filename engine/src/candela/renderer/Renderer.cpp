@@ -536,7 +536,6 @@ Renderer::~Renderer() {
     m_context->waitIdle();
 
     destroyBuffer(*m_context, m_pickBuffer);
-    destroyBuffer(*m_context, m_screenshotBuffer);
     destroyImage(*m_context, m_viewportImage);
     destroyTemporalTarget(m_aoTemporal);
     destroyTemporalTarget(m_reflectionsTemporal);
@@ -649,6 +648,7 @@ void Renderer::destroyFrameData() {
             destroyBuffer(*m_context, frame.instanceData);
         }
         destroyBuffer(*m_context, frame.constants);
+        destroyBuffer(*m_context, frame.screenshotBuffer);
         vkDestroyQueryPool(device, frame.queryPool, nullptr);
         vkDestroyFence(device, frame.inFlightFence, nullptr);
         vkDestroySemaphore(device, frame.acquireSemaphore, nullptr);
@@ -970,11 +970,7 @@ std::optional<uint32_t> Renderer::takePickResult() {
 }
 
 void Renderer::requestScreenshot(std::filesystem::path path) {
-    if (m_screenshotPending) {
-        CD_WARN("Screenshot already in flight, ignoring request");
-        return;
-    }
-    m_screenshotPath = std::move(path);
+    m_screenshotRequest = std::move(path);
 }
 
 void Renderer::recreateSwapchain() {
@@ -1656,20 +1652,22 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     frame.timestampNames = std::move(timestamps.names);
 
     // --- Screenshot readback: whole backbuffer after all passes ---
-    if (!m_screenshotPath.empty() && !m_screenshotPending) {
+    FrameData& screenshotFrame = m_frames[m_frameIndex];
+    if (!m_screenshotRequest.empty()) {
         const VkDeviceSize byteSize =
             VkDeviceSize(swapExtent.width) * swapExtent.height * 4;
-        if (m_screenshotBuffer.buffer == VK_NULL_HANDLE ||
-            m_screenshotBuffer.size < byteSize) {
-            destroyBuffer(*m_context, m_screenshotBuffer);
-            m_screenshotBuffer = createBuffer(
+        if (screenshotFrame.screenshotBuffer.buffer == VK_NULL_HANDLE ||
+            screenshotFrame.screenshotBuffer.size < byteSize) {
+            destroyBuffer(*m_context, screenshotFrame.screenshotBuffer);
+            screenshotFrame.screenshotBuffer = createBuffer(
                 *m_context, byteSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
                     VMA_ALLOCATION_CREATE_MAPPED_BIT);
             VmaAllocationInfo info{};
             vmaGetAllocationInfo(m_context->allocator(),
-                                 m_screenshotBuffer.allocation, &info);
-            m_screenshotMapped = info.pMappedData;
+                                 screenshotFrame.screenshotBuffer.allocation,
+                                 &info);
+            screenshotFrame.screenshotMapped = info.pMappedData;
         }
 
         VkImageMemoryBarrier2 barrier{};
@@ -1698,7 +1696,8 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         region.imageExtent = {swapExtent.width, swapExtent.height, 1};
         vkCmdCopyImageToBuffer(cmd, m_swapchain->image(imageIndex),
                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               m_screenshotBuffer.buffer, 1, &region);
+                               screenshotFrame.screenshotBuffer.buffer, 1,
+                               &region);
 
         std::swap(barrier.srcStageMask, barrier.dstStageMask);
         barrier.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
@@ -1707,9 +1706,10 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         vkCmdPipelineBarrier2(cmd, &dependency);
 
-        m_screenshotExtent = swapExtent;
-        m_screenshotFrameSlot = m_frameIndex;
-        m_screenshotPending = true;
+        screenshotFrame.screenshotExtent = swapExtent;
+        screenshotFrame.screenshotPath = std::move(m_screenshotRequest);
+        screenshotFrame.screenshotPending = true;
+        m_screenshotRequest.clear();
     }
 
     // --- Pick readback: one texel of the entity-ID target ---
@@ -1901,23 +1901,24 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     }
 
     // Likewise the screenshot copy — swizzle BGRA→RGBA and write the PNG.
-    if (m_screenshotPending && m_screenshotFrameSlot == m_frameIndex) {
-        const uint32_t width = m_screenshotExtent.width;
-        const uint32_t height = m_screenshotExtent.height;
+    if (frame.screenshotPending) {
+        const uint32_t width = frame.screenshotExtent.width;
+        const uint32_t height = frame.screenshotExtent.height;
         std::vector<uint8_t> rgba(size_t(width) * height * 4);
-        const auto* src = static_cast<const uint8_t*>(m_screenshotMapped);
+        const auto* src =
+            static_cast<const uint8_t*>(frame.screenshotMapped);
         for (size_t i = 0; i < rgba.size(); i += 4) {
             rgba[i + 0] = src[i + 2];
             rgba[i + 1] = src[i + 1];
             rgba[i + 2] = src[i + 0];
             rgba[i + 3] = 255;
         }
-        stbi_write_png(m_screenshotPath.string().c_str(),
+        stbi_write_png(frame.screenshotPath.string().c_str(),
                        static_cast<int>(width), static_cast<int>(height), 4,
                        rgba.data(), static_cast<int>(width) * 4);
-        CD_INFO("Screenshot written: {}", m_screenshotPath.string());
-        m_screenshotPath.clear();
-        m_screenshotPending = false;
+        CD_INFO("Screenshot written: {}", frame.screenshotPath.string());
+        frame.screenshotPath.clear();
+        frame.screenshotPending = false;
     }
 
     uint32_t imageIndex = 0;
