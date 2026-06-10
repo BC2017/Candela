@@ -5,6 +5,10 @@
 [[vk::binding(0, 0)]] Sampler2D gTextures[];
 [[vk::binding(1, 0)]] SamplerCube gCubes[];
 [[vk::binding(2, 0)]] Sampler2DArray gTexArrays[];
+// One TLAS per frame in flight. Fixed size: slang emits invalid SPIR-V for
+// unbounded acceleration-structure arrays (verified against spirv-val).
+[[vk::binding(3, 0)]] RaytracingAccelerationStructure gTLAS[2];
+[[vk::binding(4, 0)]] [format("rgba16f")] RWTexture2D<float4> gStorageImages[];
 
 // Matches candela::Vertex (48 bytes, scalar-packed).
 struct Vertex
@@ -26,6 +30,20 @@ struct PointLight
     float4 colorIntensity;  // rgb color, w intensity (lm-ish, artistic)
 };
 
+// Per-TLAS-geometry shading data for ray-query hit evaluation.
+// Index = CommittedInstanceID() + CommittedGeometryIndex().
+// Matches candela InstanceDataGPU (48 bytes).
+struct InstanceData
+{
+    Vertex* vertices;
+    uint* indices;
+    uint albedoTexture;
+    uint flags;
+    float metallicFactor;
+    float roughnessFactor;
+    float4 baseColorFactor;
+};
+
 // Matches candela::FrameConstants exactly (all members 16-byte friendly).
 struct FrameConstants
 {
@@ -39,10 +57,52 @@ struct FrameConstants
     uint pointLightCount;
     uint pad0, pad1, pad2;
     PointLight pointLights[8];
+    uint rtFlags;             // kRT* bits
+    uint tlasSlot;
+    uint pad3, pad4;
+    InstanceData* instanceData;
+    uint pad5, pad6; // uint64 padding would drag in the Int64 capability
 };
 
 static const uint kFlagAlphaMask = 1u << 0;
 static const uint kFlagHasNormalMap = 1u << 1;
+
+static const uint kRTShadows = 1u << 0;
+static const uint kRTAmbientOcclusion = 1u << 1;
+static const uint kRTReflections = 1u << 2;
+
+// --- Ray helpers ---
+
+// 1 = unoccluded. Opaque any-hit visibility ray.
+float traceVisibility(RaytracingAccelerationStructure tlas, float3 origin,
+                      float3 direction, float tMax)
+{
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = direction;
+    ray.TMin = 0.02;
+    ray.TMax = tMax;
+    RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
+    query.TraceRayInline(tlas, RAY_FLAG_NONE, 0xFF, ray);
+    query.Proceed();
+    return query.CommittedStatus() == COMMITTED_TRIANGLE_HIT ? 0.0 : 1.0;
+}
+
+// Interleaved gradient noise — stable per-pixel jitter without temporal
+// accumulation machinery (denoising lands later in Phase 5).
+float interleavedGradientNoise(uint2 pixel)
+{
+    return frac(52.9829189 *
+                frac(0.06711056 * float(pixel.x) + 0.00583715 * float(pixel.y)));
+}
+
+float3x3 orthonormalBasis(float3 n)
+{
+    float3 up = abs(n.z) < 0.999 ? float3(0.0, 0.0, 1.0) : float3(1.0, 0.0, 0.0);
+    float3 tangent = normalize(cross(up, n));
+    float3 bitangent = cross(n, tangent);
+    return float3x3(tangent, bitangent, n); // rows
+}
 
 // --- Octahedral normal encoding (RG16_UNORM) ---
 float2 octWrap(float2 v)

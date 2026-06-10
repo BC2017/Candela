@@ -34,6 +34,11 @@ public:
     VmaAllocator allocator() const { return m_allocator; }
     const std::string& gpuName() const { return m_gpuName; }
 
+    // True when VK_KHR_acceleration_structure + VK_KHR_ray_query are enabled.
+    // RT effects must fall back to raster when false.
+    bool rayTracingSupported() const { return m_rayTracingSupported; }
+    uint32_t scratchAlignment() const { return m_scratchAlignment; }
+
     void waitIdle() const;
 
     // Records, submits, and waits on the graphics queue. For uploads and
@@ -64,6 +69,8 @@ private:
     VkCommandBuffer m_immediateCmd = VK_NULL_HANDLE;
     VkFence m_immediateFence = VK_NULL_HANDLE;
     mutable std::mutex m_immediateMutex;
+    bool m_rayTracingSupported = false;
+    uint32_t m_scratchAlignment = 256;
     std::string m_gpuName;
 };
 

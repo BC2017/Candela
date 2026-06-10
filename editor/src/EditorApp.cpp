@@ -233,9 +233,10 @@ void EditorApp::drawMenuBar(World& world) {
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
-        static const char* kViews[] = {"Final",       "Albedo", "Normals",
-                                       "Metal/Rough", "AO",     "Cascades"};
-        for (int i = 0; i < 6; ++i) {
+        static const char* kViews[] = {"Final", "Albedo",   "Normals",
+                                       "Metal/Rough", "AO", "Cascades",
+                                       "RT Reflections"};
+        for (int i = 0; i < 7; ++i) {
             if (ImGui::MenuItem(kViews[i], nullptr,
                                 static_cast<int>(m_debugView) == i)) {
                 m_debugView = static_cast<DebugView>(i);
@@ -795,6 +796,25 @@ void EditorApp::drawSceneSettings(World& world) {
         m_commands.perform(world, std::make_unique<SettingsCommand>(
                                       m_settingsBefore, settings));
     }
+
+    ImGui::SeparatorText("Ray Tracing");
+    ImGui::BeginDisabled(!m_renderer.context().rayTracingSupported());
+    // Checkboxes commit instantly — snapshot before each toggle.
+    auto rtCheckbox = [&](const char* label, bool* value) {
+        const SceneSettings before = settings;
+        if (ImGui::Checkbox(label, value)) {
+            m_commands.perform(world, std::make_unique<SettingsCommand>(
+                                          before, settings));
+        }
+    };
+    rtCheckbox("RT Shadows", &settings.rtShadows);
+    rtCheckbox("RT Ambient Occlusion", &settings.rtAmbientOcclusion);
+    rtCheckbox("RT Reflections", &settings.rtReflections);
+    if (!m_renderer.context().rayTracingSupported()) {
+        ImGui::TextDisabled("(no ray tracing support on this GPU)");
+    }
+    ImGui::EndDisabled();
+
     ImGui::EndDisabled();
     ImGui::End();
 }

@@ -46,6 +46,9 @@ nlohmann::json worldToJson(const World& world) {
     settings["iblIntensity"] = world.settings.iblIntensity;
     settings["exposure"] = world.settings.exposure;
     settings["bloomStrength"] = world.settings.bloomStrength;
+    settings["rtShadows"] = world.settings.rtShadows;
+    settings["rtAmbientOcclusion"] = world.settings.rtAmbientOcclusion;
+    settings["rtReflections"] = world.settings.rtReflections;
     scene["settings"] = settings;
 
     // Stable order: iterate the Name storage (every entity has one) in
@@ -108,6 +111,11 @@ void worldFromJson(World& world, AssetRegistry& assets,
         world.settings.iblIntensity = settings["iblIntensity"].get<float>();
         world.settings.exposure = settings["exposure"].get<float>();
         world.settings.bloomStrength = settings["bloomStrength"].get<float>();
+        // Added in Phase 5 — default on for older scene files.
+        world.settings.rtShadows = settings.value("rtShadows", true);
+        world.settings.rtAmbientOcclusion =
+            settings.value("rtAmbientOcclusion", true);
+        world.settings.rtReflections = settings.value("rtReflections", true);
     }
 
     std::vector<entt::entity> entities;
