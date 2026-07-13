@@ -59,7 +59,11 @@ ShaderCompiler::ShaderCompiler() {
     const char* sdk = std::getenv("VULKAN_SDK");
     CD_ASSERT(sdk != nullptr,
               "VULKAN_SDK environment variable not set — install the Vulkan SDK");
+#if defined(_WIN32)
     m_slangc = std::filesystem::path(sdk) / "Bin" / "slangc.exe";
+#else
+    m_slangc = std::filesystem::path(sdk) / "bin" / "slangc";
+#endif
     CD_ASSERT(std::filesystem::exists(m_slangc), "slangc not found at {}",
               m_slangc.string());
 
@@ -104,16 +108,19 @@ std::optional<std::vector<uint32_t>> ShaderCompiler::compile(
         }
     }
 
-    // std::system goes through cmd.exe; the outer quotes make cmd preserve the
-    // quoting of the individual paths.
     // Column-major matrix layout so GLM matrices upload without transposes.
     // -I the source's directory so shaders can #include "common.slang".
-    const std::string command =
-        "\"\"" + m_slangc.string() + "\" \"" + sourcePath.string() +
+    std::string command =
+        "\"" + m_slangc.string() + "\" \"" + sourcePath.string() +
         "\" -entry " + entry + " -stage " + stageName(stage) +
         " -target spirv -matrix-layout-column-major -I \"" +
         sourcePath.parent_path().string() + "\" -o \"" + spvPath.string() +
-        "\" 2> \"" + errPath.string() + "\"\"";
+        "\" 2> \"" + errPath.string() + "\"";
+#if defined(_WIN32)
+    // std::system goes through cmd.exe; the outer quotes make cmd preserve
+    // the quoting of the individual paths.
+    command = "\"" + command + "\"";
+#endif
 
     const int exitCode = std::system(command.c_str());
     if (exitCode != 0) {
