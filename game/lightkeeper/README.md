@@ -8,8 +8,8 @@ You are a wisp of flame in a night-shrouded shrine. Seven candles have gone
 out. Drift through the maze and touch each one to relight it — when the last
 candle burns, dawn breaks over the shrine in real time.
 
-![Night](../docs/media/lightkeeper-night.png)
-![Dawn](../docs/media/lightkeeper-dawn.png)
+![Night](../../docs/media/lightkeeper-night.png)
+![Dawn](../../docs/media/lightkeeper-dawn.png)
 
 ## Controls
 

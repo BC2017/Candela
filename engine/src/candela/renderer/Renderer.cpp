@@ -1622,6 +1622,31 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
         graph.addPass(std::move(pass));
     }
 
+    // --- Game UI over the backbuffer (the scene tonemapped straight into
+    // it) — HUDs and menus for standalone apps, no offscreen viewport. ---
+    if (!editorMode && options.recordUI) {
+        RenderGraph::Pass pass;
+        pass.name = "game-ui";
+        pass.colorAttachments = {{backbuffer,
+                                  VK_ATTACHMENT_LOAD_OP_LOAD,
+                                  {},
+                                  VK_NULL_HANDLE,
+                                  {}}};
+        pass.execute = [swapExtent, &options](VkCommandBuffer passCmd) {
+            // ImGui supplies its own projection; default (positive) viewport
+            // orientation, unlike the scene's negative-height convention.
+            VkViewport viewport{};
+            viewport.width = static_cast<float>(swapExtent.width);
+            viewport.height = static_cast<float>(swapExtent.height);
+            viewport.maxDepth = 1.0f;
+            vkCmdSetViewport(passCmd, 0, 1, &viewport);
+            VkRect2D scissor{{0, 0}, swapExtent};
+            vkCmdSetScissor(passCmd, 0, 1, &scissor);
+            options.recordUI(passCmd);
+        };
+        graph.addPass(std::move(pass));
+    }
+
     // --- Editor UI to the backbuffer (samples the viewport image) ---
     if (editorMode && options.recordUI) {
         RenderGraph::Pass pass;
