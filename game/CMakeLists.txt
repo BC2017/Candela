@@ -2,3 +2,4 @@
 # committed content — clone + build + run, no downloads.
 add_subdirectory(lightkeeper)
 add_subdirectory(emberwake)
+add_subdirectory(tumble)
