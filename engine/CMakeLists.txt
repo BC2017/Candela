@@ -3,6 +3,9 @@ add_library(candela STATIC
     src/candela/assets/BlendImporter.cpp
     src/candela/assets/ModelAsset.cpp
     src/candela/assets/StbUsage.cpp
+    src/candela/audio/AudioEngine.cpp
+    src/candela/audio/AudioSystem.cpp
+    src/candela/audio/MiniaudioImpl.cpp
     src/candela/core/Jobs.cpp
     src/candela/core/Log.cpp
     src/candela/platform/Input.cpp
@@ -34,9 +37,12 @@ else()
   set_source_files_properties(src/candela/assets/ModelAsset.cpp
       PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-redundant-move")
   # Third-party implementation TUs are too warning-heavy for -Wall -Werror.
+  # MiniaudioImpl.cpp already wraps the header in CD_PUSH_DISABLE_WARNINGS
+  # (which covers MSVC via warning(push,0)); GCC needs the blanket -w too.
   set_source_files_properties(
       src/candela/rhi/VmaUsage.cpp
       src/candela/assets/StbUsage.cpp
+      src/candela/audio/MiniaudioImpl.cpp
       PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
@@ -62,6 +68,7 @@ target_link_libraries(candela PUBLIC
     stb
     EnTT::EnTT
     nlohmann_json::nlohmann_json
+    miniaudio
 )
 
 candela_apply_warnings(candela)

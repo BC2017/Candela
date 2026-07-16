@@ -1,5 +1,7 @@
 #include <candela/assets/AssetRegistry.h>
 #include <candela/assets/ModelAsset.h>
+#include <candela/audio/AudioEngine.h>
+#include <candela/audio/AudioSystem.h>
 #include <candela/core/Events.h>
 #include <candela/core/Jobs.h>
 #include <candela/core/Log.h>
@@ -13,6 +15,7 @@
 #include <tracy/Tracy.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +23,8 @@
 #include <format>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -61,6 +66,49 @@ std::string readFileText(const std::filesystem::path& path) {
     return stream.str();
 }
 
+// Hardware-free audio proof: force miniaudio's null backend, synthesize a
+// 440 Hz sine in-code (no committed binary asset), play it, let the timer-driven
+// null device advance, and verify the instance started and shut down cleanly.
+// Runs BEFORE JobSystem::init so it needs no job system, window, or GPU (and so
+// the "early return after JobSystem::init must shutdown" rule can't be tripped).
+int runAudioTest() {
+    candela::AudioEngine engine;
+    if (!engine.init(candela::AudioEngine::Backend::Null)) {
+        CD_ERROR("Audio test: null backend init failed");
+        return 1;
+    }
+
+    constexpr uint32_t kRate = 48000;
+    constexpr uint32_t kChannels = 1;
+    constexpr uint64_t kFrames = kRate / 2; // 0.5 s
+    std::vector<float> pcm(kFrames);
+    for (uint64_t i = 0; i < kFrames; ++i) {
+        pcm[i] = 0.25f * std::sin(2.0f * 3.14159265358979f * 440.0f *
+                                  static_cast<float>(i) /
+                                  static_cast<float>(kRate));
+    }
+
+    candela::SoundParams params;
+    params.volume = 0.8f; // flat 2D, non-looping
+    const candela::AudioEngine::InstanceId id =
+        engine.playMemory(pcm.data(), kFrames, kChannels, kRate, params);
+    if (id == candela::AudioEngine::kInvalidInstance || !engine.isPlaying(id)) {
+        CD_ERROR("Audio test: clip failed to start");
+        engine.shutdown();
+        return 1;
+    }
+
+    // Advance the null-backend device ~200 ms.
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        engine.update();
+    }
+
+    engine.shutdown();
+    CD_INFO("Audio headless test: PASS");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -74,6 +122,7 @@ int main(int argc, char** argv) {
     bool noRT = false;               // isolate raster path (debugging aid)
     std::filesystem::path flythroughDir; // capture a camera-path PNG sequence
     bool benchmark = false; // dense stress scene + frame-time report
+    bool audioTest = false; // hardware-free headless audio proof
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -89,7 +138,15 @@ int main(int argc, char** argv) {
             flythroughDir = argv[i + 1];
         } else if (std::strcmp(argv[i], "--benchmark") == 0) {
             benchmark = true;
+        } else if (std::strcmp(argv[i], "--audiotest") == 0) {
+            audioTest = true;
         }
+    }
+
+    // The audio test needs no job system, window, or GPU — handle it before
+    // JobSystem::init and return straight away.
+    if (audioTest) {
+        return runAudioTest();
     }
 
     candela::JobSystem::init();
@@ -248,6 +305,19 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Audio: an engine (Auto backend — silent no-op if no device) plus the
+        // per-frame ECS→engine bridge. The sandbox fly camera is engine-side,
+        // so a dedicated listener entity is synced to it each frame below. No
+        // audio asset is committed, so the default scene adds no AudioSource;
+        // any loaded scene carrying an `audioSource` (with an existing clip)
+        // still plays. Both live in this inner scope, so RAII shuts the engine
+        // down before JobSystem::shutdown().
+        candela::AudioEngine audio;
+        audio.init();
+        candela::AudioSystem audioSystem{audio};
+        const entt::entity listener = world.createEntity("audio_listener");
+        world.registry.emplace<candela::AudioListener>(listener);
+
         const candela::InputActions input =
             candela::InputActions::flyCameraDefaults();
 
@@ -330,7 +400,20 @@ int main(int argc, char** argv) {
                 camera.yawRadians = glm::radians(-90.0f);
                 camera.pitchRadians = 0.0f;
             }
+
+            // Sync the listener entity to the fly camera before transforms are
+            // recomputed, then run the audio system off the fresh hierarchy.
+            {
+                auto& lt =
+                    world.registry.get<candela::LocalTransform>(listener);
+                lt.translation = camera.position;
+                lt.rotation = glm::quat(glm::vec3(
+                    camera.pitchRadians, camera.yawRadians, 0.0f));
+            }
             world.updateTransforms();
+
+            audioSystem.update(world);
+            audio.update();
 
             // Capture late so async assets and temporal accumulation settle.
             if (!screenshotPath.empty() && maxFrames != 0 &&

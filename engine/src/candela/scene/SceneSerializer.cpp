@@ -93,6 +93,21 @@ nlohmann::json worldToJson(const World& world) {
             e["camera"] = {{"fovYDegrees", camera->fovYDegrees},
                            {"nearPlane", camera->nearPlane}};
         }
+        if (const auto* listener = registry.try_get<AudioListener>(entity)) {
+            e["audioListener"] = listener->active;
+        }
+        if (const auto* source = registry.try_get<AudioSource>(entity)) {
+            // Runtime fields (instance/started) are intentionally omitted so
+            // the round-trip stays byte-stable.
+            e["audioSource"] = {{"clip", source->clip},
+                                {"volume", source->volume},
+                                {"pitch", source->pitch},
+                                {"loop", source->loop},
+                                {"spatial", source->spatial},
+                                {"autoplay", source->autoplay},
+                                {"minDistance", source->minDistance},
+                                {"maxDistance", source->maxDistance}};
+        }
         entityArray.push_back(e);
     }
     scene["entities"] = entityArray;
@@ -147,6 +162,23 @@ void worldFromJson(World& world, AssetRegistry& assets,
             auto& camera = world.registry.emplace<CameraComponent>(entity);
             camera.fovYDegrees = e["camera"]["fovYDegrees"].get<float>();
             camera.nearPlane = e["camera"]["nearPlane"].get<float>();
+        }
+        if (e.contains("audioListener")) {
+            world.registry.emplace<AudioListener>(
+                entity, e["audioListener"].get<bool>());
+        }
+        if (e.contains("audioSource")) {
+            const auto& j = e["audioSource"];
+            AudioSource source;
+            source.clip = j.value("clip", std::string{});
+            source.volume = j.value("volume", 1.0f);
+            source.pitch = j.value("pitch", 1.0f);
+            source.loop = j.value("loop", false);
+            source.spatial = j.value("spatial", true);
+            source.autoplay = j.value("autoplay", true);
+            source.minDistance = j.value("minDistance", 1.0f);
+            source.maxDistance = j.value("maxDistance", 100.0f);
+            world.registry.emplace<AudioSource>(entity, source);
         }
         entities.push_back(entity);
     }
