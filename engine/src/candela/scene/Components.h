@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace candela {
 
@@ -36,6 +37,35 @@ struct WorldTransform {
 struct MeshRenderer {
     AssetGuid model = kInvalidGuid;
     uint32_t meshIndex = 0;
+};
+
+// A skinned mesh instance. Lives on the node entity that carried a skinIndex,
+// alongside a Skeleton (and usually an Animator). The renderer pre-skins it
+// into a per-frame buffer instead of drawing the bind pose.
+struct SkinnedMeshRenderer {
+    AssetGuid model = kInvalidGuid;
+    uint32_t meshIndex = 0;
+    int skinIndex = -1; // index into ModelAsset::skins
+};
+
+// The joint entities driving a SkinnedMeshRenderer, in palette order. joints[j]
+// is the entity whose WorldTransform gives joint j's world matrix; inverseBind
+// and jointNodeIndex are parallel arrays. jointNodeIndex maps each joint to its
+// model node index so the animator can resolve channel targets.
+struct Skeleton {
+    std::vector<entt::entity> joints;
+    std::vector<glm::mat4> inverseBind;
+    std::vector<int> jointNodeIndex;
+};
+
+// Drives one clip on the skeleton this entity owns.
+struct Animator {
+    AssetGuid model = kInvalidGuid;
+    int clip = 0;    // index into ModelAsset::animations
+    float time = 0.0f;
+    float speed = 1.0f;
+    bool loop = true;
+    bool playing = true;
 };
 
 struct PointLightComponent {

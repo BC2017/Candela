@@ -11,7 +11,9 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <tracy/Tracy.hpp>
 
+#include <algorithm>
 #include <cfloat>
+#include <cstring>
 #include <unordered_map>
 
 namespace candela {
@@ -26,6 +28,9 @@ void ModelAsset::destroy(Context& context) {
         for (GpuPrimitive& primitive : mesh.primitives) {
             destroyBuffer(context, primitive.vertexBuffer);
             destroyBuffer(context, primitive.indexBuffer);
+            if (primitive.skinVertexBuffer.buffer != VK_NULL_HANDLE) {
+                destroyBuffer(context, primitive.skinVertexBuffer);
+            }
         }
     }
     for (GpuImage& texture : textures) {
@@ -34,6 +39,8 @@ void ModelAsset::destroy(Context& context) {
     meshes.clear();
     textures.clear();
     nodes.clear();
+    skins.clear();
+    animations.clear();
 }
 
 namespace {
@@ -190,6 +197,41 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                     });
             }
 
+            // Skinning attributes (JOINTS_0 / WEIGHTS_0). Both must be present
+            // for the primitive to skin. Joint indices pack two per uint.
+            bool primSkinned = false;
+            std::vector<SkinVertex> skinVerts;
+            if (const auto* jointsAttr = primitive.findAttribute("JOINTS_0");
+                jointsAttr != primitive.attributes.end()) {
+                if (const auto* weightsAttr =
+                        primitive.findAttribute("WEIGHTS_0");
+                    weightsAttr != primitive.attributes.end()) {
+                    primSkinned = true;
+                    skinVerts.assign(positionAccessor.count, SkinVertex{});
+                    fastgltf::iterateAccessorWithIndex<glm::u16vec4>(
+                        asset, asset.accessors[jointsAttr->accessorIndex],
+                        [&](glm::u16vec4 j, size_t index) {
+                            skinVerts[index].joints01 =
+                                uint32_t(j.x) | (uint32_t(j.y) << 16);
+                            skinVerts[index].joints23 =
+                                uint32_t(j.z) | (uint32_t(j.w) << 16);
+                        });
+                    fastgltf::iterateAccessorWithIndex<glm::vec4>(
+                        asset, asset.accessors[weightsAttr->accessorIndex],
+                        [&](glm::vec4 w, size_t index) {
+                            // glTF weights need not sum to 1; renormalize.
+                            const float s = w.x + w.y + w.z + w.w;
+                            if (s > 0.0f) {
+                                w /= s;
+                            }
+                            skinVerts[index].weights[0] = w.x;
+                            skinVerts[index].weights[1] = w.y;
+                            skinVerts[index].weights[2] = w.z;
+                            skinVerts[index].weights[3] = w.w;
+                        });
+                }
+            }
+
             CD_ASSERT(primitive.indicesAccessor.has_value(),
                       "GenerateMeshIndices should guarantee indices");
             const auto& indexAccessor =
@@ -225,6 +267,15 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
             gpu.occlusionTexture = whiteIndex;
             gpu.metallicFactor = 0.0f;
             gpu.roughnessFactor = 1.0f;
+
+            if (primSkinned) {
+                gpu.skinned = true;
+                gpu.skinVertexBuffer = createBufferWithData(
+                    context, std::as_bytes(std::span(skinVerts)),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                mesh.skinned = true;
+            }
 
             if (primitive.materialIndex) {
                 const auto& material =
@@ -314,6 +365,11 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 primitiveCounts.push_back(range.primitiveCount);
             }
 
+            // Skinned meshes are refit (mode=UPDATE) from the per-frame
+            // skinned vertex buffer, which requires ALLOW_UPDATE and rules out
+            // compaction (a compacted AS cannot be updated).
+            const bool allowUpdate = mesh.skinned;
+
             VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
             buildInfo.sType =
                 VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
@@ -321,7 +377,9 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
             buildInfo.flags =
                 VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR;
+                (allowUpdate
+                     ? VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR
+                     : VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_COMPACTION_BIT_KHR);
             buildInfo.mode =
                 VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
             buildInfo.geometryCount =
@@ -335,6 +393,7 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 context.device(),
                 VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildInfo,
                 primitiveCounts.data(), &sizes);
+            mesh.blasScratchSize = sizes.updateScratchSize;
 
             mesh.blasBuffer = createBuffer(
                 context, sizes.accelerationStructureSize,
@@ -368,60 +427,63 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
             });
             destroyBuffer(context, scratch);
 
-            // --- Compaction: copy into a right-sized structure (~half the
-            // memory on typical meshes) and drop the build-sized one. ---
-            VkQueryPoolCreateInfo queryInfo{};
-            queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-            queryInfo.queryType =
-                VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
-            queryInfo.queryCount = 1;
-            VkQueryPool query = VK_NULL_HANDLE;
-            VK_CHECK(vkCreateQueryPool(context.device(), &queryInfo, nullptr,
-                                       &query));
-            context.immediateSubmit([&](VkCommandBuffer cmd) {
-                vkCmdResetQueryPool(cmd, query, 0, 1);
-                vkCmdWriteAccelerationStructuresPropertiesKHR(
-                    cmd, 1, &mesh.blas,
-                    VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
-                    query, 0);
-            });
-            VkDeviceSize compactedSize = 0;
-            VK_CHECK(vkGetQueryPoolResults(
-                context.device(), query, 0, 1, sizeof(compactedSize),
-                &compactedSize, sizeof(compactedSize),
-                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
-            vkDestroyQueryPool(context.device(), query, nullptr);
+            if (!allowUpdate) {
+                // --- Compaction: copy into a right-sized structure (~half the
+                // memory on typical meshes) and drop the build-sized one. ---
+                VkQueryPoolCreateInfo queryInfo{};
+                queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+                queryInfo.queryType =
+                    VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR;
+                queryInfo.queryCount = 1;
+                VkQueryPool query = VK_NULL_HANDLE;
+                VK_CHECK(vkCreateQueryPool(context.device(), &queryInfo, nullptr,
+                                           &query));
+                context.immediateSubmit([&](VkCommandBuffer cmd) {
+                    vkCmdResetQueryPool(cmd, query, 0, 1);
+                    vkCmdWriteAccelerationStructuresPropertiesKHR(
+                        cmd, 1, &mesh.blas,
+                        VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR,
+                        query, 0);
+                });
+                VkDeviceSize compactedSize = 0;
+                VK_CHECK(vkGetQueryPoolResults(
+                    context.device(), query, 0, 1, sizeof(compactedSize),
+                    &compactedSize, sizeof(compactedSize),
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT));
+                vkDestroyQueryPool(context.device(), query, nullptr);
 
-            GpuBuffer compactBuffer = createBuffer(
-                context, compactedSize,
-                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
-                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-            VkAccelerationStructureCreateInfoKHR compactInfo{};
-            compactInfo.sType =
-                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-            compactInfo.buffer = compactBuffer.buffer;
-            compactInfo.size = compactedSize;
-            compactInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            VkAccelerationStructureKHR compactBlas = VK_NULL_HANDLE;
-            VK_CHECK(vkCreateAccelerationStructureKHR(
-                context.device(), &compactInfo, nullptr, &compactBlas));
-            context.immediateSubmit([&](VkCommandBuffer cmd) {
-                VkCopyAccelerationStructureInfoKHR copy{};
-                copy.sType =
-                    VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
-                copy.src = mesh.blas;
-                copy.dst = compactBlas;
-                copy.mode =
-                    VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
-                vkCmdCopyAccelerationStructureKHR(cmd, &copy);
-            });
-            vkDestroyAccelerationStructureKHR(context.device(), mesh.blas,
-                                              nullptr);
-            destroyBuffer(context, mesh.blasBuffer);
-            mesh.blas = compactBlas;
-            mesh.blasBuffer = compactBuffer;
-            blasBuiltBytes += sizes.accelerationStructureSize;
-            blasCompactedBytes += compactedSize;
+                GpuBuffer compactBuffer = createBuffer(
+                    context, compactedSize,
+                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+                VkAccelerationStructureCreateInfoKHR compactInfo{};
+                compactInfo.sType =
+                    VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
+                compactInfo.buffer = compactBuffer.buffer;
+                compactInfo.size = compactedSize;
+                compactInfo.type =
+                    VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+                VkAccelerationStructureKHR compactBlas = VK_NULL_HANDLE;
+                VK_CHECK(vkCreateAccelerationStructureKHR(
+                    context.device(), &compactInfo, nullptr, &compactBlas));
+                context.immediateSubmit([&](VkCommandBuffer cmd) {
+                    VkCopyAccelerationStructureInfoKHR copy{};
+                    copy.sType =
+                        VK_STRUCTURE_TYPE_COPY_ACCELERATION_STRUCTURE_INFO_KHR;
+                    copy.src = mesh.blas;
+                    copy.dst = compactBlas;
+                    copy.mode =
+                        VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR;
+                    vkCmdCopyAccelerationStructureKHR(cmd, &copy);
+                });
+                vkDestroyAccelerationStructureKHR(context.device(), mesh.blas,
+                                                  nullptr);
+                destroyBuffer(context, mesh.blasBuffer);
+                mesh.blas = compactBlas;
+                mesh.blasBuffer = compactBuffer;
+                blasBuiltBytes += sizes.accelerationStructureSize;
+                blasCompactedBytes += compactedSize;
+            }
 
             VkAccelerationStructureDeviceAddressInfoKHR addressInfo{};
             addressInfo.sType =
@@ -446,6 +508,9 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
         node.name = gltfNode.name;
         if (gltfNode.meshIndex) {
             node.meshIndex = static_cast<int>(*gltfNode.meshIndex);
+        }
+        if (gltfNode.skinIndex) {
+            node.skinIndex = static_cast<int>(*gltfNode.skinIndex);
         }
         if (const auto* trs =
                 std::get_if<fastgltf::TRS>(&gltfNode.transform)) {
@@ -476,6 +541,103 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
         }
         for (size_t child : gltfNode.children) {
             model.nodes[child].parent = static_cast<int>(nodeIndex);
+        }
+    }
+
+    // --- Skins: joint node lists + inverse-bind matrices (palette order) ---
+    model.skins.resize(asset.skins.size());
+    for (size_t s = 0; s < asset.skins.size(); ++s) {
+        const auto& gltfSkin = asset.skins[s];
+        Skin& skin = model.skins[s];
+        skin.skeletonRoot =
+            gltfSkin.skeleton ? static_cast<int>(*gltfSkin.skeleton) : -1;
+        skin.jointNodes.reserve(gltfSkin.joints.size());
+        for (size_t joint : gltfSkin.joints) {
+            skin.jointNodes.push_back(static_cast<int>(joint));
+        }
+        skin.inverseBind.assign(skin.jointNodes.size(), glm::mat4(1.0f));
+        if (gltfSkin.inverseBindMatrices) {
+            fastgltf::iterateAccessorWithIndex<glm::mat4>(
+                asset, asset.accessors[*gltfSkin.inverseBindMatrices],
+                [&](glm::mat4 m, size_t index) {
+                    if (index < skin.inverseBind.size()) {
+                        skin.inverseBind[index] = m;
+                    }
+                });
+        }
+    }
+
+    // --- Animation clips: TRS channels sampled by AnimationSampling.h ---
+    model.animations.resize(asset.animations.size());
+    for (size_t a = 0; a < asset.animations.size(); ++a) {
+        const auto& gltfAnim = asset.animations[a];
+        AnimationClip& clip = model.animations[a];
+        clip.name = gltfAnim.name;
+        for (const auto& ch : gltfAnim.channels) {
+            if (!ch.nodeIndex) {
+                continue;
+            }
+            if (ch.path == fastgltf::AnimationPath::Weights) {
+                continue; // morph targets deferred
+            }
+            const auto& sampler = gltfAnim.samplers[ch.samplerIndex];
+            AnimationChannel out;
+            out.targetNode = static_cast<int>(*ch.nodeIndex);
+            out.path = ch.path == fastgltf::AnimationPath::Translation
+                           ? AnimationChannel::Path::Translation
+                       : ch.path == fastgltf::AnimationPath::Scale
+                           ? AnimationChannel::Path::Scale
+                           : AnimationChannel::Path::Rotation;
+            const bool cubic = sampler.interpolation ==
+                               fastgltf::AnimationInterpolation::CubicSpline;
+            out.interp = sampler.interpolation ==
+                                 fastgltf::AnimationInterpolation::Step
+                             ? AnimationChannel::Interp::Step
+                             : AnimationChannel::Interp::Linear;
+
+            fastgltf::iterateAccessor<float>(
+                asset, asset.accessors[sampler.inputAccessor],
+                [&](float t) { out.times.push_back(t); });
+
+            // CubicSpline outputs 3 elements per key (in-tangent, vertex,
+            // out-tangent); keep only the vertex and treat the track as
+            // linear (correct cubic Hermite is a follow-up).
+            const size_t keyCount = out.times.size();
+            if (out.path == AnimationChannel::Path::Rotation) {
+                std::vector<glm::vec4> raw;
+                fastgltf::iterateAccessor<glm::vec4>(
+                    asset, asset.accessors[sampler.outputAccessor],
+                    [&](glm::vec4 q) { raw.push_back(q); });
+                if (cubic && keyCount > 0 && raw.size() >= keyCount * 3) {
+                    out.values.reserve(keyCount);
+                    for (size_t k = 0; k < keyCount; ++k) {
+                        out.values.push_back(raw[k * 3 + 1]);
+                    }
+                } else {
+                    out.values = std::move(raw);
+                }
+            } else {
+                std::vector<glm::vec3> raw;
+                fastgltf::iterateAccessor<glm::vec3>(
+                    asset, asset.accessors[sampler.outputAccessor],
+                    [&](glm::vec3 v) { raw.push_back(v); });
+                if (cubic && keyCount > 0 && raw.size() >= keyCount * 3) {
+                    out.values.reserve(keyCount);
+                    for (size_t k = 0; k < keyCount; ++k) {
+                        out.values.push_back(glm::vec4(raw[k * 3 + 1], 0.0f));
+                    }
+                } else {
+                    out.values.reserve(raw.size());
+                    for (const glm::vec3& v : raw) {
+                        out.values.push_back(glm::vec4(v, 0.0f));
+                    }
+                }
+            }
+
+            if (!out.times.empty()) {
+                clip.duration = std::max(clip.duration, out.times.back());
+            }
+            clip.channels.push_back(std::move(out));
         }
     }
 
@@ -533,9 +695,11 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
     for (const GpuMesh& mesh : model.meshes) {
         primitiveCount += mesh.primitives.size();
     }
-    CD_INFO("Imported {}: {} meshes ({} primitives), {} textures, {} nodes",
+    CD_INFO("Imported {}: {} meshes ({} primitives), {} textures, {} nodes, "
+            "{} skins, {} animations",
             path.filename().string(), model.meshes.size(), primitiveCount,
-            model.textures.size(), model.nodes.size());
+            model.textures.size(), model.nodes.size(), model.skins.size(),
+            model.animations.size());
     return model;
 }
 

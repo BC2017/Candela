@@ -1,4 +1,5 @@
 add_library(candela STATIC
+    src/candela/assets/AnimationInfo.cpp
     src/candela/assets/AssetRegistry.cpp
     src/candela/assets/BlendImporter.cpp
     src/candela/assets/ModelAsset.cpp
@@ -29,12 +30,16 @@ target_include_directories(candela PUBLIC src)
 
 if(MSVC)
   # fastgltf's accessor templates trip C4100 when instantiated under /W4.
-  set_source_files_properties(src/candela/assets/ModelAsset.cpp
+  set_source_files_properties(
+      src/candela/assets/ModelAsset.cpp
+      src/candela/assets/AnimationInfo.cpp
       PROPERTIES COMPILE_OPTIONS "/wd4100")
 else()
   # Same warning, GCC spelling; -Wredundant-move fires inside fastgltf 0.8
   # headers (fixed upstream after our pinned tag).
-  set_source_files_properties(src/candela/assets/ModelAsset.cpp
+  set_source_files_properties(
+      src/candela/assets/ModelAsset.cpp
+      src/candela/assets/AnimationInfo.cpp
       PROPERTIES COMPILE_OPTIONS "-Wno-unused-parameter;-Wno-redundant-move")
   # Third-party implementation TUs are too warning-heavy for -Wall -Werror.
   # MiniaudioImpl.cpp already wraps the header in CD_PUSH_DISABLE_WARNINGS
