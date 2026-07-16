@@ -7,6 +7,7 @@
 
 #include <entt/entt.hpp>
 
+#include <cstdint>
 #include <string>
 
 namespace candela {
@@ -48,6 +49,48 @@ struct PointLightComponent {
 struct CameraComponent {
     float fovYDegrees = 70.0f;
     float nearPlane = 0.05f;
+};
+
+// --- Physics (Jolt-backed; see physics/PhysicsSystem.h). Runtime handles are
+// opaque integers so this header never includes Jolt. -----------------------
+
+// Sentinel matching JPH::BodyID::cInvalidBodyID without pulling in Jolt.
+inline constexpr uint32_t kInvalidBodyId = 0xffffffffu;
+
+// A rigid body simulated by the PhysicsSystem. Static/kinematic bodies are
+// world geometry; dynamic bodies have their pose written back to
+// LocalTransform each frame.
+struct RigidBody {
+    enum class MotionType : uint8_t { Static, Kinematic, Dynamic };
+    enum class ShapeType : uint8_t { Box, Sphere, Capsule };
+
+    MotionType motionType = MotionType::Dynamic;
+    ShapeType shape = ShapeType::Box;
+
+    // Box    -> halfExtents (x, y, z).
+    // Sphere -> radius = halfExtents.x.
+    // Capsule-> radius = halfExtents.x, half cylinder height = halfExtents.y.
+    glm::vec3 halfExtents{0.5f};
+
+    float mass = 1.0f; // ignored for Static/Kinematic
+    float friction = 0.5f;
+    float restitution = 0.0f;
+
+    // Runtime — assigned by PhysicsSystem on first update; never authored or
+    // serialized.
+    uint32_t bodyId = kInvalidBodyId;
+};
+
+// A capsule character controller (the player). The backing JPH::Character
+// lives in the PhysicsSystem; its pose is synced back to LocalTransform.
+struct CharacterController {
+    float radius = 0.3f;     // capsule radius
+    float halfHeight = 0.6f; // half height of the cylindrical section
+    float mass = 75.0f;
+    float friction = 0.5f;
+
+    // Runtime — the backing body's id; never authored or serialized.
+    uint32_t bodyId = kInvalidBodyId;
 };
 
 // Per-scene lighting/environment settings, stored in registry context.

@@ -30,6 +30,52 @@ glm::quat quatFromJson(const nlohmann::json& j) {
             j[3].get<float>()};
 }
 
+// Physics enums serialize as stable strings so scene files stay readable and
+// robust to future enum reordering.
+const char* rigidBodyMotionName(RigidBody::MotionType motion) {
+    switch (motion) {
+    case RigidBody::MotionType::Static:
+        return "static";
+    case RigidBody::MotionType::Kinematic:
+        return "kinematic";
+    case RigidBody::MotionType::Dynamic:
+    default:
+        return "dynamic";
+    }
+}
+
+RigidBody::MotionType rigidBodyMotionFromName(const std::string& name) {
+    if (name == "static") {
+        return RigidBody::MotionType::Static;
+    }
+    if (name == "kinematic") {
+        return RigidBody::MotionType::Kinematic;
+    }
+    return RigidBody::MotionType::Dynamic;
+}
+
+const char* rigidBodyShapeName(RigidBody::ShapeType shape) {
+    switch (shape) {
+    case RigidBody::ShapeType::Sphere:
+        return "sphere";
+    case RigidBody::ShapeType::Capsule:
+        return "capsule";
+    case RigidBody::ShapeType::Box:
+    default:
+        return "box";
+    }
+}
+
+RigidBody::ShapeType rigidBodyShapeFromName(const std::string& name) {
+    if (name == "sphere") {
+        return RigidBody::ShapeType::Sphere;
+    }
+    if (name == "capsule") {
+        return RigidBody::ShapeType::Capsule;
+    }
+    return RigidBody::ShapeType::Box;
+}
+
 } // namespace
 
 namespace {
@@ -93,6 +139,20 @@ nlohmann::json worldToJson(const World& world) {
             e["camera"] = {{"fovYDegrees", camera->fovYDegrees},
                            {"nearPlane", camera->nearPlane}};
         }
+        if (const auto* rb = registry.try_get<RigidBody>(entity)) {
+            e["rigidBody"] = {{"motion", rigidBodyMotionName(rb->motionType)},
+                              {"shape", rigidBodyShapeName(rb->shape)},
+                              {"halfExtents", vec3ToJson(rb->halfExtents)},
+                              {"mass", rb->mass},
+                              {"friction", rb->friction},
+                              {"restitution", rb->restitution}};
+        }
+        if (const auto* cc = registry.try_get<CharacterController>(entity)) {
+            e["characterController"] = {{"radius", cc->radius},
+                                        {"halfHeight", cc->halfHeight},
+                                        {"mass", cc->mass},
+                                        {"friction", cc->friction}};
+        }
         entityArray.push_back(e);
     }
     scene["entities"] = entityArray;
@@ -147,6 +207,25 @@ void worldFromJson(World& world, AssetRegistry& assets,
             auto& camera = world.registry.emplace<CameraComponent>(entity);
             camera.fovYDegrees = e["camera"]["fovYDegrees"].get<float>();
             camera.nearPlane = e["camera"]["nearPlane"].get<float>();
+        }
+        if (e.contains("rigidBody")) {
+            const auto& j = e["rigidBody"];
+            auto& rb = world.registry.emplace<RigidBody>(entity);
+            rb.motionType =
+                rigidBodyMotionFromName(j["motion"].get<std::string>());
+            rb.shape = rigidBodyShapeFromName(j["shape"].get<std::string>());
+            rb.halfExtents = vec3FromJson(j["halfExtents"]);
+            rb.mass = j["mass"].get<float>();
+            rb.friction = j["friction"].get<float>();
+            rb.restitution = j["restitution"].get<float>();
+        }
+        if (e.contains("characterController")) {
+            const auto& j = e["characterController"];
+            auto& cc = world.registry.emplace<CharacterController>(entity);
+            cc.radius = j["radius"].get<float>();
+            cc.halfHeight = j["halfHeight"].get<float>();
+            cc.mass = j["mass"].get<float>();
+            cc.friction = j["friction"].get<float>();
         }
         entities.push_back(entity);
     }

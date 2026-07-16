@@ -82,8 +82,46 @@ FetchContent_Declare(imguizmo
   GIT_TAG be8aa4aeab86b402701c8c1df011bd8cd776760b
   SOURCE_SUBDIR does-not-exist)
 
+# Jolt Physics. Its buildable CMakeLists lives under Build/, hence
+# SOURCE_SUBDIR. All ABI-affecting JPH_* defines are carried by the exported
+# `Jolt` target's INTERFACE_COMPILE_DEFINITIONS and inherited automatically by
+# every TU that includes Jolt headers — this is the single source of truth,
+# eliminating the classic "headers/lib built with different flags" corruption.
+set(TARGET_UNIT_TESTS OFF CACHE BOOL "" FORCE)
+set(TARGET_HELLO_WORLD OFF CACHE BOOL "" FORCE)
+set(TARGET_PERFORMANCE_TEST OFF CACHE BOOL "" FORCE)
+set(TARGET_SAMPLES OFF CACHE BOOL "" FORCE)
+set(TARGET_VIEWER OFF CACHE BOOL "" FORCE)
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
+set(OVERRIDE_CXX_FLAGS OFF CACHE BOOL "" FORCE) # respect our toolchain flags
+# Jolt defaults this ON, which forces /MT on its target while every other dep
+# uses the default dynamic runtime (/MD) — a mismatch that fails to link on
+# MSVC. Force the dynamic runtime so all targets agree.
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE)
+# Force the SSE2 x86-64 baseline: both MSVC and GCC compile SSE2 intrinsics
+# with no special -march flag, so consumers need no arch flags to match Jolt's
+# ABI. (Any USE_* left ON emits a JPH_USE_* interface define whose intrinsics
+# GCC refuses to compile without a matching -msseX/-mavx flag on our targets.)
+set(USE_SSE4_1 OFF CACHE BOOL "" FORCE)
+set(USE_SSE4_2 OFF CACHE BOOL "" FORCE)
+set(USE_AVX OFF CACHE BOOL "" FORCE)
+set(USE_AVX2 OFF CACHE BOOL "" FORCE)
+set(USE_AVX512 OFF CACHE BOOL "" FORCE)
+set(USE_LZCNT OFF CACHE BOOL "" FORCE)
+set(USE_TZCNT OFF CACHE BOOL "" FORCE)
+set(USE_F16C OFF CACHE BOOL "" FORCE)
+set(USE_FMADD OFF CACHE BOOL "" FORCE)
+set(FLOATING_POINT_EXCEPTIONS_ENABLED OFF CACHE BOOL "" FORCE)
+set(CROSS_PLATFORM_DETERMINISTIC OFF CACHE BOOL "" FORCE)
+set(DOUBLE_PRECISION OFF CACHE BOOL "" FORCE) # RVec3 == Vec3 (float)
+FetchContent_Declare(jolt
+  GIT_REPOSITORY https://github.com/jrouwe/JoltPhysics.git
+  GIT_TAG v5.3.0
+  GIT_SHALLOW ON
+  SOURCE_SUBDIR Build)
+
 FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb
-                           entt nlohmann_json imgui imguizmo)
+                           entt nlohmann_json imgui imguizmo jolt)
 
 # Without an installed SDK (CI), volk has no vulkan.h on its include path —
 # point every consumer at the Vulkan::Headers target explicitly.

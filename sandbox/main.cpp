@@ -3,6 +3,7 @@
 #include <candela/core/Events.h>
 #include <candela/core/Jobs.h>
 #include <candela/core/Log.h>
+#include <candela/physics/PhysicsSystem.h>
 #include <candela/platform/Input.h>
 #include <candela/platform/Window.h>
 #include <candela/renderer/Camera.h>
@@ -65,6 +66,16 @@ std::string readFileText(const std::filesystem::path& path) {
 
 int main(int argc, char** argv) {
     candela::Log::init();
+
+    // GPU-free physics self-test. Dispatched before JobSystem::init() and any
+    // Vulkan object, so it never touches the GPU and needs no shutdown
+    // bookkeeping (Jolt owns its own thread pool).
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--physicstest") == 0) {
+            return candela::runPhysicsSelfTest();
+        }
+    }
+
     CD_INFO("Candela sandbox — Phase 3");
 
     uint64_t maxFrames = 0;
@@ -111,6 +122,7 @@ int main(int argc, char** argv) {
         assets.scan(assetDir);
 
         candela::World world;
+        candela::PhysicsSystem physics;
         candela::Camera camera;
         camera.position = {-7.0f, 1.8f, -0.5f};
         camera.yawRadians = glm::radians(-90.0f);
@@ -324,6 +336,11 @@ int main(int argc, char** argv) {
                 camera.yawRadians = glm::radians(-90.0f);
                 camera.pitchRadians = 0.0f;
             }
+            // Advance physics before recomputing world transforms so dynamic
+            // bodies' new local poses flow into their WorldTransform the same
+            // frame. A no-op until a scene authors RigidBody/CharacterController
+            // components (the views are empty otherwise).
+            physics.update(world, dt);
             world.updateTransforms();
 
             // Capture late so async assets and temporal accumulation settle.
