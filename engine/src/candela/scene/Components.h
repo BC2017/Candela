@@ -7,6 +7,7 @@
 
 #include <entt/entt.hpp>
 
+#include <cstdint>
 #include <string>
 
 namespace candela {
@@ -48,6 +49,31 @@ struct PointLightComponent {
 struct CameraComponent {
     float fovYDegrees = 70.0f;
     float nearPlane = 0.05f;
+};
+
+// Marks the entity whose WorldTransform drives the 3D audio listener (usually
+// the camera/player). If several exist, the AudioSystem uses the first active.
+struct AudioListener {
+    bool active = true;
+};
+
+// A sound emitter driven by the AudioSystem. `clip` is a filesystem path to a
+// .wav/.ogg/.mp3 (AssetGuid routing is a follow-up — the registry currently
+// models only ModelAsset). `instance`/`started` are runtime-only and are NOT
+// serialized, so scene save → load → save round-trips byte-stable.
+struct AudioSource {
+    std::string clip;
+    float volume = 1.0f;
+    float pitch = 1.0f;
+    bool loop = false;
+    bool spatial = true;  // false = flat 2D
+    bool autoplay = true; // start once on the first AudioSystem tick
+    float minDistance = 1.0f;
+    float maxDistance = 100.0f;
+
+    // Runtime state (not serialized).
+    uint32_t instance = 0; // AudioEngine::InstanceId; 0 = not started
+    bool started = false;
 };
 
 // Per-scene lighting/environment settings, stored in registry context.
