@@ -1,3 +1,4 @@
+#include <candela/assets/AnimationInfo.h>
 #include <candela/assets/AssetRegistry.h>
 #include <candela/assets/ModelAsset.h>
 #include <candela/core/Events.h>
@@ -74,6 +75,7 @@ int main(int argc, char** argv) {
     bool noRT = false;               // isolate raster path (debugging aid)
     std::filesystem::path flythroughDir; // capture a camera-path PNG sequence
     bool benchmark = false; // dense stress scene + frame-time report
+    std::filesystem::path animInfoPath; // GPU-free skin/animation dump
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -89,7 +91,16 @@ int main(int argc, char** argv) {
             flythroughDir = argv[i + 1];
         } else if (std::strcmp(argv[i], "--benchmark") == 0) {
             benchmark = true;
+        } else if (std::strcmp(argv[i], "--animinfo") == 0 && i + 1 < argc) {
+            animInfoPath = argv[i + 1];
         }
+    }
+
+    // GPU-free inspector: parse skins/animations and print a summary, then
+    // return BEFORE JobSystem::init() so there is nothing to shut down.
+    if (!animInfoPath.empty()) {
+        candela::printAnimationInfo(animInfoPath);
+        return 0;
     }
 
     candela::JobSystem::init();
@@ -324,6 +335,9 @@ int main(int argc, char** argv) {
                 camera.yawRadians = glm::radians(-90.0f);
                 camera.pitchRadians = 0.0f;
             }
+            // Sample animation clips into joint LocalTransforms before the
+            // hierarchy resolve so the animated pose flows through.
+            world.updateAnimations(assets, dt);
             world.updateTransforms();
 
             // Capture late so async assets and temporal accumulation settle.

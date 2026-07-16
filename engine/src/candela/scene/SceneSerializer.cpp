@@ -84,6 +84,22 @@ nlohmann::json worldToJson(const World& world) {
             e["meshRenderer"] = {{"model", guidToString(mesh->model)},
                                  {"mesh", mesh->meshIndex}};
         }
+        // Skeleton is rebuilt by instantiateModel, so only the light-weight
+        // driver components are persisted (keeps round-trip stable).
+        if (const auto* smr =
+                registry.try_get<SkinnedMeshRenderer>(entity)) {
+            e["skinnedMeshRenderer"] = {{"model", guidToString(smr->model)},
+                                        {"mesh", smr->meshIndex},
+                                        {"skin", smr->skinIndex}};
+        }
+        if (const auto* anim = registry.try_get<Animator>(entity)) {
+            e["animator"] = {{"model", guidToString(anim->model)},
+                             {"clip", anim->clip},
+                             {"time", anim->time},
+                             {"speed", anim->speed},
+                             {"loop", anim->loop},
+                             {"playing", anim->playing}};
+        }
         if (const auto* light = registry.try_get<PointLightComponent>(entity)) {
             e["pointLight"] = {{"color", vec3ToJson(light->color)},
                                {"intensity", light->intensity},
@@ -135,6 +151,25 @@ void worldFromJson(World& world, AssetRegistry& assets,
             world.registry.emplace<MeshRenderer>(
                 entity, guid, e["meshRenderer"]["mesh"].get<uint32_t>());
             assets.requestModel(guid); // async — geometry streams in
+        }
+        if (e.contains("skinnedMeshRenderer")) {
+            const AssetGuid guid = guidFromString(
+                e["skinnedMeshRenderer"]["model"].get<std::string>());
+            world.registry.emplace<SkinnedMeshRenderer>(
+                entity, guid,
+                e["skinnedMeshRenderer"]["mesh"].get<uint32_t>(),
+                e["skinnedMeshRenderer"]["skin"].get<int>());
+            assets.requestModel(guid);
+        }
+        if (e.contains("animator")) {
+            auto& anim = world.registry.emplace<Animator>(entity);
+            anim.model =
+                guidFromString(e["animator"]["model"].get<std::string>());
+            anim.clip = e["animator"]["clip"].get<int>();
+            anim.time = e["animator"]["time"].get<float>();
+            anim.speed = e["animator"]["speed"].get<float>();
+            anim.loop = e["animator"]["loop"].get<bool>();
+            anim.playing = e["animator"]["playing"].get<bool>();
         }
         if (e.contains("pointLight")) {
             auto& light =

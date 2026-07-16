@@ -128,6 +128,13 @@ private:
         GpuBuffer instanceData; // InstanceDataGPU[], mapped
         void* instanceDataMapped = nullptr;
         uint32_t tlasSlot = 0; // bindless AccelStruct index
+        // Skeletal skinning (per frame in flight so compute writes never race
+        // the previous frame's reads). The skinned-vertex ring is device-local
+        // (compute writes, VS/AS-build reads); the palette is host-mapped.
+        GpuBuffer skinnedVertices; // Vertex[], BDA-addressable, device-local
+        GpuBuffer jointPalette;    // glm::mat4[], host-visible mapped, BDA
+        void* jointPaletteMapped = nullptr;
+        GpuBuffer blasRefitScratch; // scratch for per-frame BLAS UPDATE
         // GPU pass timings (2 timestamps per pass).
         VkQueryPool queryPool = VK_NULL_HANDLE;
         std::vector<std::string> timestampNames;
@@ -171,6 +178,26 @@ private:
         bool visible = true;
     };
 
+    // One skinned primitive scheduled this frame. The G-buffer/shadow passes
+    // draw it exactly like a FrameDraw but with the vertex pointer aimed at the
+    // pre-skinned sub-range instead of the bind pose.
+    struct SkinnedDraw {
+        glm::mat4 transform;
+        const GpuPrimitive* primitive;
+        VkDeviceAddress skinnedVertices; // dest sub-range in frame ring
+        VkDeviceAddress palette;         // this instance's palette base address
+        uint32_t entityId;
+        bool visible = true;
+    };
+
+    // One skinned mesh instance to refit (BLAS UPDATE) this frame. Spans a
+    // contiguous run of m_skinnedDraws (one per skinned primitive of the mesh).
+    struct SkinnedRefit {
+        const GpuMesh* mesh;
+        uint32_t firstDraw;
+        uint32_t drawCount;
+    };
+
     struct FrameLight {
         glm::vec3 position;
         float radius;
@@ -183,9 +210,18 @@ private:
                                     const std::string& entry);
     bool createPipelines();
     void createRayTracingResources();
+    void createSkinningResources();
     // Fills instance/data buffers from the ECS; returns instance count.
     uint32_t fillRayTracingInstances(FrameData& frame, World& world,
                                      AssetRegistry& assets);
+    // Computes joint palettes + skinned-instance table into the frame's ring
+    // buffers (CPU, pre-record). Must run after updateTransforms and after the
+    // frame's fence has cleared.
+    void fillSkinningData(FrameData& frame, World& world,
+                          AssetRegistry& assets);
+    // Records per-frame BLAS refits (mode=UPDATE) from the skinned buffer, on
+    // the raw command buffer before the TLAS build.
+    void refitSkinnedBlas(VkCommandBuffer cmd, FrameData& frame);
     void buildTLAS(VkCommandBuffer cmd, FrameData& frame,
                    uint32_t instanceCount);
 
@@ -235,12 +271,16 @@ private:
     VkPipeline m_bloomDownPipeline = VK_NULL_HANDLE;
     VkPipeline m_bloomUpPipeline = VK_NULL_HANDLE;
     VkPipeline m_tonemapPipeline = VK_NULL_HANDLE;
+    VkPipeline m_skinningPipeline = VK_NULL_HANDLE; // compute pre-skinning
     VkPipeline m_reflectionsPipeline = VK_NULL_HANDLE; // null without RT
     VkPipeline m_aoPipeline = VK_NULL_HANDLE;          // null without RT
     VkPipeline m_temporalPipeline = VK_NULL_HANDLE;
 
     static constexpr uint32_t kMaxRTInstances = 1024;
     static constexpr uint32_t kMaxRTInstanceData = 4096;
+    // Per-frame skinned-vertex ring (48 B each) and joint palette (64 B each).
+    static constexpr uint32_t kMaxSkinnedVertices = 1u << 19; // 512K → 24 MB
+    static constexpr uint32_t kMaxJointMatrices = 4096;
     bool m_rtSupported = false;
     uint32_t m_rtInstanceCount = 0; // filled per frame before recording
     std::unordered_map<VkImageView, uint32_t> m_storageSlots;
@@ -272,6 +312,8 @@ private:
     std::unordered_map<VkImageView, uint32_t> m_viewSlots;
 
     std::vector<FrameDraw> m_frameDraws;
+    std::vector<SkinnedDraw> m_skinnedDraws;
+    std::vector<SkinnedRefit> m_skinnedRefits;
     std::vector<FrameLight> m_frameLights;
 
     // Editor offscreen viewport (persistent — ImGui's descriptor references
