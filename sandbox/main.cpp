@@ -179,10 +179,16 @@ int main(int argc, char** argv) {
                     helmets, benchPath.string());
         } else if (!modelPath.empty()) {
             // Model-viewer mode: one model, default sun + IBL, auto-framed.
-            const candela::AssetGuid guid =
+            candela::AssetGuid guid =
                 assets.guidForPath(std::filesystem::absolute(modelPath));
             if (guid == candela::kInvalidGuid) {
-                CD_ERROR("Model not in the asset registry: {}",
+                // Not under the scanned content dir — register it in place
+                // (any .gltf/.glb/.blend anywhere on disk).
+                guid = assets.registerFile(
+                    std::filesystem::absolute(modelPath));
+            }
+            if (guid == candela::kInvalidGuid) {
+                CD_ERROR("Not an importable model file: {}",
                          modelPath.string());
                 return 1;
             }
