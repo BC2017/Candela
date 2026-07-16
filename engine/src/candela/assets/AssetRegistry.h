@@ -43,7 +43,16 @@ public:
     AssetRegistry& operator=(const AssetRegistry&) = delete;
 
     // Walks the content directory, creating .meta files where missing.
+    // Safe to call again at runtime — known files keep their GUIDs, new
+    // files are added.
     void scan(const std::filesystem::path& contentDir);
+
+    // Registers a single importable source in place — the file may live
+    // anywhere on disk, not just under the content directory. Creates the
+    // .meta sidecar next to it; the source is hot-reload watched like any
+    // scanned asset. Returns its GUID, or kInvalidGuid for missing files
+    // and unsupported extensions.
+    AssetGuid registerFile(const std::filesystem::path& path);
 
     AssetGuid guidForPath(const std::filesystem::path& path) const;
     std::filesystem::path pathForGuid(AssetGuid guid) const;

@@ -41,6 +41,10 @@ public:
 
 private:
     void drawMenuBar(World& world);
+    // Clears the world and instantiates a registered .blend as a new scene.
+    void importBlendAsNewScene(World& world, AssetGuid guid,
+                               const std::filesystem::path& source);
+    void drawImportPopup(World& world);
     void drawViewport(World& world);
     void drawLightGizmos(World& world, const glm::vec2& imagePos,
                          const glm::vec2& imageSize);
@@ -93,6 +97,11 @@ private:
 
     bool m_playing = false;
     std::string m_playSnapshot;
+
+    // Import Blender Scene menu state.
+    bool m_importMenuWasOpen = false;
+    bool m_importPopupPending = false;
+    char m_importPathBuffer[512] = {};
 
     DebugView m_debugView = DebugView::Final;
     float m_orbitDistance = 5.0f;

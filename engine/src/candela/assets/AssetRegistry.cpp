@@ -109,23 +109,34 @@ void AssetRegistry::scan(const std::filesystem::path& contentDir) {
         if (!it->is_regular_file()) {
             continue;
         }
-        const auto extension = it->path().extension();
-        if (extension != ".gltf" && extension != ".glb" &&
-            extension != ".blend") {
-            continue;
+        if (registerFile(it->path()) != kInvalidGuid) {
+            ++found;
         }
-        const AssetGuid guid = ensureMeta(it->path());
-
-        std::scoped_lock lock(m_mutex);
-        Entry& entry = m_entries[guid];
-        entry.path = it->path();
-        // Normalized key — callers may pass any separator style.
-        m_pathToGuid[std::filesystem::weakly_canonical(it->path())
-                         .generic_string()] = guid;
-        ++found;
     }
     CD_INFO("AssetRegistry: {} importable assets under {}", found,
             contentDir.string());
+}
+
+AssetGuid AssetRegistry::registerFile(const std::filesystem::path& path) {
+    const auto extension = path.extension();
+    if (extension != ".gltf" && extension != ".glb" &&
+        extension != ".blend") {
+        return kInvalidGuid;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+        CD_WARN("registerFile: not a file: {}", path.string());
+        return kInvalidGuid;
+    }
+    const AssetGuid guid = ensureMeta(path);
+
+    std::scoped_lock lock(m_mutex);
+    Entry& entry = m_entries[guid];
+    entry.path = path;
+    // Normalized key — callers may pass any separator style.
+    m_pathToGuid[std::filesystem::weakly_canonical(path, ec)
+                     .generic_string()] = guid;
+    return guid;
 }
 
 AssetGuid AssetRegistry::guidForPath(const std::filesystem::path& path) const {

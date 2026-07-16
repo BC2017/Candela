@@ -17,10 +17,36 @@
 
 #include <algorithm>
 #include <cstring>
+#include <system_error>
+
+#if defined(_WIN32)
+    #include <windows.h>
+    #include <commdlg.h>
+#endif
 
 namespace candela::editor {
 
 namespace {
+
+#if defined(_WIN32)
+// Native open-file dialog for .blend import. Synchronous — the frame stalls
+// while the dialog is up, which is fine for a tool.
+std::filesystem::path openBlendFileDialog() {
+    wchar_t fileBuffer[MAX_PATH] = L"";
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.lpstrFilter =
+        L"Blender files (*.blend)\0*.blend\0All files (*.*)\0*.*\0";
+    ofn.lpstrFile = fileBuffer;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrTitle = L"Import .blend as New Scene";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if (GetOpenFileNameW(&ofn) == 0) {
+        return {}; // cancelled
+    }
+    return std::filesystem::path{fileBuffer};
+}
+#endif
 
 // Finite-far GL-style projection for ImGuizmo (the renderer's infinite
 // reverse-Z projection confuses its depth math).
@@ -261,6 +287,7 @@ RenderOptions EditorApp::frame(World& world, float dt) {
     }
 
     drawMenuBar(world);
+    drawImportPopup(world);
     drawViewport(world);
     drawHierarchy(world);
     drawInspector(world);
@@ -311,6 +338,59 @@ RenderOptions EditorApp::frame(World& world, float dt) {
     return options;
 }
 
+void EditorApp::importBlendAsNewScene(World& world, AssetGuid guid,
+                                      const std::filesystem::path& source) {
+    world.registry.clear();
+    world.settings = {};
+    m_commands.clear();
+    m_selected = 0;
+    world.instantiateModel(m_assets, guid);
+    assignEditorIds(world);
+    m_scenePath =
+        m_assetDir / "scenes" / (source.stem().string() + ".candela");
+}
+
+// Path-entry fallback for platforms without the native file dialog.
+void EditorApp::drawImportPopup(World& world) {
+    if (m_importPopupPending) {
+        ImGui::OpenPopup("Import .blend");
+        m_importPopupPending = false;
+    }
+    ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                            ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (!ImGui::BeginPopupModal("Import .blend", nullptr,
+                                ImGuiWindowFlags_AlwaysAutoResize)) {
+        return;
+    }
+    ImGui::TextUnformatted("Path to a .blend file:");
+    ImGui::SetNextItemWidth(460.0f);
+    const bool entered = ImGui::InputText(
+        "##blendpath", m_importPathBuffer, sizeof(m_importPathBuffer),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    const std::filesystem::path path{m_importPathBuffer};
+    std::error_code ec;
+    const bool valid = path.extension() == ".blend" &&
+                       std::filesystem::is_regular_file(path, ec);
+    if (!valid && m_importPathBuffer[0] != '\0') {
+        ImGui::TextDisabled("Not an existing .blend file");
+    }
+    ImGui::BeginDisabled(!valid);
+    const bool importClicked = ImGui::Button("Import");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    const bool cancelClicked = ImGui::Button("Cancel");
+    if (valid && (importClicked || entered)) {
+        const AssetGuid guid = m_assets.registerFile(path);
+        if (guid != kInvalidGuid) {
+            importBlendAsNewScene(world, guid, path);
+        }
+        ImGui::CloseCurrentPopup();
+    } else if (cancelClicked) {
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndPopup();
+}
+
 void EditorApp::drawMenuBar(World& world) {
     if (!ImGui::BeginMainMenuBar()) {
         return;
@@ -348,11 +428,18 @@ void EditorApp::drawMenuBar(World& world) {
             }
             ImGui::EndMenu();
         }
-        // .blend sources discovered in the content directory open as a fresh
-        // scene: reset the world (New Scene semantics), then instantiate the
-        // converted model hierarchy. The first import runs Blender headless,
-        // so it can take a while.
-        if (ImGui::BeginMenu("Import Blender Scene", !m_playing)) {
+        // .blend sources open as a fresh scene: reset the world (New Scene
+        // semantics), then instantiate the converted model hierarchy. The
+        // first import runs Blender headless, so it can take a while.
+        const bool importMenuOpen =
+            ImGui::BeginMenu("Import Blender Scene", !m_playing);
+        if (importMenuOpen && !m_importMenuWasOpen) {
+            // Pick up .blend files dropped into the content directory since
+            // startup — the scan is idempotent and keeps existing GUIDs.
+            m_assets.scan(m_assetDir);
+        }
+        m_importMenuWasOpen = importMenuOpen;
+        if (importMenuOpen) {
             auto blends = m_assets.allAssets();
             std::erase_if(blends, [](const auto& asset) {
                 return asset.second.extension() != ".blend";
@@ -363,18 +450,29 @@ void EditorApp::drawMenuBar(World& world) {
                       });
             for (const auto& [guid, path] : blends) {
                 if (ImGui::MenuItem(path.filename().string().c_str())) {
-                    world.registry.clear();
-                    world.settings = {};
-                    m_commands.clear();
-                    m_selected = 0;
-                    world.instantiateModel(m_assets, guid);
-                    assignEditorIds(world);
-                    m_scenePath = m_assetDir / "scenes" /
-                                  (path.stem().string() + ".candela");
+                    importBlendAsNewScene(world, guid, path);
                 }
             }
             if (blends.empty()) {
-                ImGui::TextDisabled("No .blend files in content");
+                ImGui::TextDisabled("No .blend files under assets/");
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Import .blend from Disk...")) {
+#if defined(_WIN32)
+                const std::filesystem::path picked = openBlendFileDialog();
+                if (!picked.empty()) {
+                    const AssetGuid guid = m_assets.registerFile(picked);
+                    if (guid != kInvalidGuid) {
+                        importBlendAsNewScene(world, guid, picked);
+                    } else {
+                        CD_WARN("Not an importable file: {}",
+                                picked.string());
+                    }
+                }
+#else
+                m_importPopupPending = true;
+                m_importPathBuffer[0] = '\0';
+#endif
             }
             ImGui::EndMenu();
         }
