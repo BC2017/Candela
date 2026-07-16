@@ -82,8 +82,19 @@ FetchContent_Declare(imguizmo
   GIT_TAG be8aa4aeab86b402701c8c1df011bd8cd776760b
   SOURCE_SUBDIR does-not-exist)
 
+# miniaudio is a single header (plus a bundled CMake that builds tests/extras
+# we don't want). Fetch sources only — a bogus SOURCE_SUBDIR keeps FetchContent
+# from add_subdirectory-ing it — and expose the header via an INTERFACE target
+# below, the same pattern as stb. The implementation is compiled in exactly one
+# TU (engine/src/candela/audio/MiniaudioImpl.cpp).
+FetchContent_Declare(miniaudio
+  GIT_REPOSITORY https://github.com/mackron/miniaudio.git
+  GIT_TAG 0.11.21
+  GIT_SHALLOW ON
+  SOURCE_SUBDIR does-not-exist)
+
 FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb
-                           entt nlohmann_json imgui imguizmo)
+                           entt nlohmann_json imgui imguizmo miniaudio)
 
 # Without an installed SDK (CI), volk has no vulkan.h on its include path —
 # point every consumer at the Vulkan::Headers target explicitly.
@@ -117,3 +128,13 @@ target_link_libraries(candela_imgui PUBLIC volk::volk glfw)
 # stb has no CMake build — expose it as an interface include target.
 add_library(stb INTERFACE)
 target_include_directories(stb INTERFACE ${stb_SOURCE_DIR})
+
+# miniaudio has no usable CMake for us — expose the header as an interface
+# target. On Linux the implementation TU needs pthread/dl/m; Windows and macOS
+# pull their audio backends from the OS SDK automatically.
+add_library(miniaudio INTERFACE)
+target_include_directories(miniaudio INTERFACE ${miniaudio_SOURCE_DIR})
+if(UNIX AND NOT APPLE)
+  find_package(Threads REQUIRED)
+  target_link_libraries(miniaudio INTERFACE Threads::Threads ${CMAKE_DL_LIBS} m)
+endif()
