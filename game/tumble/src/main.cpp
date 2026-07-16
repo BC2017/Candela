@@ -220,7 +220,7 @@ int runSelfTest() {
     return 1;
 }
 
-SceneSettings daylight() {
+SceneSettings daylightSettings() {
     SceneSettings s;
     s.toSun = glm::normalize(glm::vec3(0.35f, 1.0f, 0.28f));
     s.sunIntensity = 4.2f;
@@ -280,7 +280,7 @@ int main(int argc, char** argv) {
         assets.getModelBlocking(cubeGuid);
 
         World world;
-        world.settings = daylight();
+        world.settings = daylightSettings();
         Sandbox sb = buildSandbox(world, cubeGuid);
         PhysicsSystem physics;
 
