@@ -86,7 +86,29 @@ void csMain(uint3 id : SV_DispatchThreadID)
     ray.TMax = 200.0;
     RayQuery<RAY_FLAG_NONE> query;
     query.TraceRayInline(gTLAS[frame.tlasSlot], RAY_FLAG_NONE, 0xFF, ray);
-    query.Proceed();
+    // Traversal must loop: a single Proceed() stops at the first non-opaque
+    // (alpha-masked) candidate and drops the true closest opaque hit behind it,
+    // so alpha-tested surfaces vanish from reflections and rays punch through to
+    // the environment. Resolve cutouts by alpha, mirroring traceVisibility().
+    while (query.Proceed())
+    {
+        if (query.CandidateType() != CANDIDATE_NON_OPAQUE_TRIANGLE)
+            continue;
+        InstanceData cand = frame.instanceData[query.CandidateInstanceID() +
+                                               query.CandidateGeometryIndex()];
+        uint candTri = query.CandidatePrimitiveIndex();
+        float2 candBary = query.CandidateTriangleBarycentrics();
+        float2 cuv0 = cand.vertices[cand.indices[candTri * 3 + 0]].uv();
+        float2 cuv1 = cand.vertices[cand.indices[candTri * 3 + 1]].uv();
+        float2 cuv2 = cand.vertices[cand.indices[candTri * 3 + 2]].uv();
+        float2 candUV = cuv0 * (1.0 - candBary.x - candBary.y) +
+                        cuv1 * candBary.x + cuv2 * candBary.y;
+        float candAlpha =
+            gTextures[cand.albedoTexture].SampleLevel(candUV, 0.0).a *
+            cand.baseColorFactor.a;
+        if (candAlpha >= 0.5)
+            query.CommitNonOpaqueTriangleHit();
+    }
 
     float3 color;
     if (query.CommittedStatus() == COMMITTED_TRIANGLE_HIT)

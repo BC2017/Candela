@@ -102,16 +102,17 @@ void RenderGraph::barrierTo(VkCommandBuffer cmd, Resource& resource,
                             VkPipelineStageFlags2 stage, VkAccessFlags2 access,
                             VkImageLayout layout) {
     const bool layoutChange = resource.state.layout != layout;
-    const bool hadWrites =
-        (resource.state.access &
-         (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-          VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-          VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT)) != 0;
-    const bool isWrite =
-        (access & (VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                   VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                   VK_ACCESS_2_TRANSFER_WRITE_BIT |
-                   VK_ACCESS_2_SHADER_WRITE_BIT)) != 0;
+    // Under synchronization2 the storage-image write bit (SHADER_STORAGE_WRITE,
+    // bit 34) is DISTINCT from the legacy SHADER_WRITE bit (bit 9); the storage
+    // barrier path records the former, so it must be in the hazard mask or a
+    // compute->compute chain that stays in GENERAL layout gets no barrier.
+    constexpr VkAccessFlags2 kWriteAccess =
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+        VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
+        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    const bool hadWrites = (resource.state.access & kWriteAccess) != 0;
+    const bool isWrite = (access & kWriteAccess) != 0;
     if (!layoutChange && !hadWrites && !isWrite) {
         return; // read-after-read needs no barrier
     }

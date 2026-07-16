@@ -163,12 +163,17 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 mesh.boundsMax = glm::max(mesh.boundsMax, primMax);
             }
 
+            // glTF requires every attribute accessor to share POSITION's count,
+            // but fastgltf does not enforce it; a malformed asset with a larger
+            // secondary accessor would otherwise write past `vertices`. Guard
+            // each write (a no-op for conformant assets).
             if (const auto* normalAttr = primitive.findAttribute("NORMAL");
                 normalAttr != primitive.attributes.end()) {
                 fastgltf::iterateAccessorWithIndex<glm::vec3>(
                     asset, asset.accessors[normalAttr->accessorIndex],
                     [&](glm::vec3 value, size_t index) {
-                        vertices[index].normal = value;
+                        if (index < vertices.size())
+                            vertices[index].normal = value;
                     });
             }
             if (const auto* uvAttr = primitive.findAttribute("TEXCOORD_0");
@@ -176,7 +181,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 fastgltf::iterateAccessorWithIndex<glm::vec2>(
                     asset, asset.accessors[uvAttr->accessorIndex],
                     [&](glm::vec2 value, size_t index) {
-                        vertices[index].uv = value;
+                        if (index < vertices.size())
+                            vertices[index].uv = value;
                     });
             }
             bool hasTangents = false;
@@ -186,7 +192,8 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
                 fastgltf::iterateAccessorWithIndex<glm::vec4>(
                     asset, asset.accessors[tangentAttr->accessorIndex],
                     [&](glm::vec4 value, size_t index) {
-                        vertices[index].tangent = value;
+                        if (index < vertices.size())
+                            vertices[index].tangent = value;
                     });
             }
 
@@ -491,11 +498,15 @@ ModelAsset importGltfModel(Context& context, Bindless& bindless,
             glm::mat4 local = glm::translate(glm::mat4(1.0f), node.translation);
             local *= glm::mat4_cast(node.rotation);
             local = glm::scale(local, node.scale);
-            globals[index] =
-                node.parent >= 0
-                    ? self(self, static_cast<size_t>(node.parent)) * local
-                    : local;
+            // Mark resolved BEFORE recursing so a malformed glTF with a node
+            // parent cycle terminates against this placeholder instead of
+            // recursing until the stack overflows.
             computed[index] = true;
+            globals[index] = local;
+            if (node.parent >= 0) {
+                globals[index] =
+                    self(self, static_cast<size_t>(node.parent)) * local;
+            }
             return globals[index];
         };
 

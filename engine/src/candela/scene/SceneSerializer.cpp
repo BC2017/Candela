@@ -155,8 +155,14 @@ void worldFromJson(World& world, AssetRegistry& assets,
     size_t index = 0;
     for (const auto& e : scene["entities"]) {
         if (e.contains("parent")) {
-            world.setParent(entities[index],
-                            entities[e["parent"].get<size_t>()]);
+            const size_t parentIndex = e["parent"].get<size_t>();
+            if (parentIndex < entities.size()) {
+                world.setParent(entities[index], entities[parentIndex]);
+            } else {
+                CD_WARN("Scene parent index {} out of range ({} entities); "
+                        "skipping link",
+                        parentIndex, entities.size());
+            }
         }
         ++index;
     }

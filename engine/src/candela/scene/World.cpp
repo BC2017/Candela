@@ -27,6 +27,24 @@ entt::entity World::createEntity(const std::string& name) {
 }
 
 void World::setParent(entt::entity child, entt::entity parent) {
+    // Reject reparents that would create a cycle: walk up from the prospective
+    // parent and abort if we reach the child. Guarding here protects every
+    // caller (editor drag-drop, scene deserialization, model instantiation) —
+    // a parent cycle would otherwise make updateTransforms recurse until the
+    // stack overflows. The existing hierarchy is always acyclic (this guard is
+    // the only way a Parent link is installed), so the walk terminates.
+    if (child == parent) {
+        CD_WARN("setParent: an entity cannot be its own parent");
+        return;
+    }
+    for (const Parent* link = registry.try_get<Parent>(parent);
+         link != nullptr && registry.valid(link->value);
+         link = registry.try_get<Parent>(link->value)) {
+        if (link->value == child) {
+            CD_WARN("setParent: rejected reparent that would create a cycle");
+            return;
+        }
+    }
     registry.emplace_or_replace<Parent>(child, parent);
 }
 
@@ -42,14 +60,18 @@ void World::updateTransforms() {
         if (auto it = computed.find(entity); it != computed.end()) {
             return it->second;
         }
-        const auto& local = registry.get<LocalTransform>(entity);
-        glm::mat4 world = local.matrix();
+        const glm::mat4 localMatrix = registry.get<LocalTransform>(entity).matrix();
+        // Insert the local transform as a placeholder BEFORE recursing so that
+        // even if a parent cycle somehow exists it terminates against this
+        // entry instead of overflowing the stack. unordered_map node refs are
+        // stable across the insertions the recursion performs, so `slot` holds.
+        auto slot = computed.emplace(entity, localMatrix).first;
         if (const auto* parent = registry.try_get<Parent>(entity);
             parent != nullptr && registry.valid(parent->value) &&
             registry.all_of<LocalTransform>(parent->value)) {
-            world = self(self, parent->value) * world;
+            slot->second = self(self, parent->value) * localMatrix;
         }
-        return computed.emplace(entity, world).first->second;
+        return slot->second;
     };
 
     for (const entt::entity entity : registry.view<LocalTransform>()) {

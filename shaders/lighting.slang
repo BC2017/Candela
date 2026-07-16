@@ -150,7 +150,12 @@ float4 fsMain(FullscreenVSOut input) : SV_Target
     float occlusion = material.b;
 
     float3 V = normalize(frame.cameraPosition.xyz - worldPos);
-    float viewDepth = length(frame.cameraPosition.xyz - worldPos);
+    // Cascade splits are planar view-space (-Z) depths (see Cascades.cpp), so
+    // the selection metric must be planar depth, NOT Euclidean distance —
+    // otherwise peripheral fragments pick a cascade whose ortho does not cover
+    // them and lose their shadow. clip.w == -view_z == planar depth for the
+    // reverse-Z perspective (Camera::projection), and is jitter-invariant.
+    float viewDepth = mul(frame.viewProjection, float4(worldPos, 1.0)).w;
 
     // Ray-traced AO: traced + temporally accumulated by their own passes;
     // the lighting pass just samples the converged result.
