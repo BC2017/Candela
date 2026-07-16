@@ -30,6 +30,52 @@ glm::quat quatFromJson(const nlohmann::json& j) {
             j[3].get<float>()};
 }
 
+// Physics enums serialize as stable strings so scene files stay readable and
+// robust to future enum reordering.
+const char* rigidBodyMotionName(RigidBody::MotionType motion) {
+    switch (motion) {
+    case RigidBody::MotionType::Static:
+        return "static";
+    case RigidBody::MotionType::Kinematic:
+        return "kinematic";
+    case RigidBody::MotionType::Dynamic:
+    default:
+        return "dynamic";
+    }
+}
+
+RigidBody::MotionType rigidBodyMotionFromName(const std::string& name) {
+    if (name == "static") {
+        return RigidBody::MotionType::Static;
+    }
+    if (name == "kinematic") {
+        return RigidBody::MotionType::Kinematic;
+    }
+    return RigidBody::MotionType::Dynamic;
+}
+
+const char* rigidBodyShapeName(RigidBody::ShapeType shape) {
+    switch (shape) {
+    case RigidBody::ShapeType::Sphere:
+        return "sphere";
+    case RigidBody::ShapeType::Capsule:
+        return "capsule";
+    case RigidBody::ShapeType::Box:
+    default:
+        return "box";
+    }
+}
+
+RigidBody::ShapeType rigidBodyShapeFromName(const std::string& name) {
+    if (name == "sphere") {
+        return RigidBody::ShapeType::Sphere;
+    }
+    if (name == "capsule") {
+        return RigidBody::ShapeType::Capsule;
+    }
+    return RigidBody::ShapeType::Box;
+}
+
 } // namespace
 
 namespace {
@@ -84,6 +130,22 @@ nlohmann::json worldToJson(const World& world) {
             e["meshRenderer"] = {{"model", guidToString(mesh->model)},
                                  {"mesh", mesh->meshIndex}};
         }
+        // Skeleton is rebuilt by instantiateModel, so only the light-weight
+        // driver components are persisted (keeps round-trip stable).
+        if (const auto* smr =
+                registry.try_get<SkinnedMeshRenderer>(entity)) {
+            e["skinnedMeshRenderer"] = {{"model", guidToString(smr->model)},
+                                        {"mesh", smr->meshIndex},
+                                        {"skin", smr->skinIndex}};
+        }
+        if (const auto* anim = registry.try_get<Animator>(entity)) {
+            e["animator"] = {{"model", guidToString(anim->model)},
+                             {"clip", anim->clip},
+                             {"time", anim->time},
+                             {"speed", anim->speed},
+                             {"loop", anim->loop},
+                             {"playing", anim->playing}};
+        }
         if (const auto* light = registry.try_get<PointLightComponent>(entity)) {
             e["pointLight"] = {{"color", vec3ToJson(light->color)},
                                {"intensity", light->intensity},
@@ -107,6 +169,20 @@ nlohmann::json worldToJson(const World& world) {
                                 {"autoplay", source->autoplay},
                                 {"minDistance", source->minDistance},
                                 {"maxDistance", source->maxDistance}};
+        }
+        if (const auto* rb = registry.try_get<RigidBody>(entity)) {
+            e["rigidBody"] = {{"motion", rigidBodyMotionName(rb->motionType)},
+                              {"shape", rigidBodyShapeName(rb->shape)},
+                              {"halfExtents", vec3ToJson(rb->halfExtents)},
+                              {"mass", rb->mass},
+                              {"friction", rb->friction},
+                              {"restitution", rb->restitution}};
+        }
+        if (const auto* cc = registry.try_get<CharacterController>(entity)) {
+            e["characterController"] = {{"radius", cc->radius},
+                                        {"halfHeight", cc->halfHeight},
+                                        {"mass", cc->mass},
+                                        {"friction", cc->friction}};
         }
         entityArray.push_back(e);
     }
@@ -151,6 +227,25 @@ void worldFromJson(World& world, AssetRegistry& assets,
                 entity, guid, e["meshRenderer"]["mesh"].get<uint32_t>());
             assets.requestModel(guid); // async — geometry streams in
         }
+        if (e.contains("skinnedMeshRenderer")) {
+            const AssetGuid guid = guidFromString(
+                e["skinnedMeshRenderer"]["model"].get<std::string>());
+            world.registry.emplace<SkinnedMeshRenderer>(
+                entity, guid,
+                e["skinnedMeshRenderer"]["mesh"].get<uint32_t>(),
+                e["skinnedMeshRenderer"]["skin"].get<int>());
+            assets.requestModel(guid);
+        }
+        if (e.contains("animator")) {
+            auto& anim = world.registry.emplace<Animator>(entity);
+            anim.model =
+                guidFromString(e["animator"]["model"].get<std::string>());
+            anim.clip = e["animator"]["clip"].get<int>();
+            anim.time = e["animator"]["time"].get<float>();
+            anim.speed = e["animator"]["speed"].get<float>();
+            anim.loop = e["animator"]["loop"].get<bool>();
+            anim.playing = e["animator"]["playing"].get<bool>();
+        }
         if (e.contains("pointLight")) {
             auto& light =
                 world.registry.emplace<PointLightComponent>(entity);
@@ -179,6 +274,25 @@ void worldFromJson(World& world, AssetRegistry& assets,
             source.minDistance = j.value("minDistance", 1.0f);
             source.maxDistance = j.value("maxDistance", 100.0f);
             world.registry.emplace<AudioSource>(entity, source);
+        }
+        if (e.contains("rigidBody")) {
+            const auto& j = e["rigidBody"];
+            auto& rb = world.registry.emplace<RigidBody>(entity);
+            rb.motionType =
+                rigidBodyMotionFromName(j["motion"].get<std::string>());
+            rb.shape = rigidBodyShapeFromName(j["shape"].get<std::string>());
+            rb.halfExtents = vec3FromJson(j["halfExtents"]);
+            rb.mass = j["mass"].get<float>();
+            rb.friction = j["friction"].get<float>();
+            rb.restitution = j["restitution"].get<float>();
+        }
+        if (e.contains("characterController")) {
+            const auto& j = e["characterController"];
+            auto& cc = world.registry.emplace<CharacterController>(entity);
+            cc.radius = j["radius"].get<float>();
+            cc.halfHeight = j["halfHeight"].get<float>();
+            cc.mass = j["mass"].get<float>();
+            cc.friction = j["friction"].get<float>();
         }
         entities.push_back(entity);
     }

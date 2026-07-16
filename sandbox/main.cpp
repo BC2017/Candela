@@ -1,3 +1,4 @@
+#include <candela/assets/AnimationInfo.h>
 #include <candela/assets/AssetRegistry.h>
 #include <candela/assets/ModelAsset.h>
 #include <candela/audio/AudioEngine.h>
@@ -5,6 +6,7 @@
 #include <candela/core/Events.h>
 #include <candela/core/Jobs.h>
 #include <candela/core/Log.h>
+#include <candela/physics/PhysicsSystem.h>
 #include <candela/platform/Input.h>
 #include <candela/platform/Window.h>
 #include <candela/renderer/Camera.h>
@@ -113,6 +115,16 @@ int runAudioTest() {
 
 int main(int argc, char** argv) {
     candela::Log::init();
+
+    // GPU-free physics self-test. Dispatched before JobSystem::init() and any
+    // Vulkan object, so it never touches the GPU and needs no shutdown
+    // bookkeeping (Jolt owns its own thread pool).
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--physicstest") == 0) {
+            return candela::runPhysicsSelfTest();
+        }
+    }
+
     CD_INFO("Candela sandbox — Phase 3");
 
     uint64_t maxFrames = 0;
@@ -123,6 +135,7 @@ int main(int argc, char** argv) {
     std::filesystem::path flythroughDir; // capture a camera-path PNG sequence
     bool benchmark = false; // dense stress scene + frame-time report
     bool audioTest = false; // hardware-free headless audio proof
+    std::filesystem::path animInfoPath; // GPU-free skin/animation dump
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             maxFrames = std::strtoull(argv[i + 1], nullptr, 10);
@@ -140,6 +153,8 @@ int main(int argc, char** argv) {
             benchmark = true;
         } else if (std::strcmp(argv[i], "--audiotest") == 0) {
             audioTest = true;
+        } else if (std::strcmp(argv[i], "--animinfo") == 0 && i + 1 < argc) {
+            animInfoPath = argv[i + 1];
         }
     }
 
@@ -147,6 +162,13 @@ int main(int argc, char** argv) {
     // JobSystem::init and return straight away.
     if (audioTest) {
         return runAudioTest();
+    }
+
+    // GPU-free inspector: parse skins/animations and print a summary, then
+    // return BEFORE JobSystem::init() so there is nothing to shut down.
+    if (!animInfoPath.empty()) {
+        candela::printAnimationInfo(animInfoPath);
+        return 0;
     }
 
     candela::JobSystem::init();
@@ -168,6 +190,7 @@ int main(int argc, char** argv) {
         assets.scan(assetDir);
 
         candela::World world;
+        candela::PhysicsSystem physics;
         candela::Camera camera;
         camera.position = {-7.0f, 1.8f, -0.5f};
         camera.yawRadians = glm::radians(-90.0f);
@@ -400,6 +423,15 @@ int main(int argc, char** argv) {
                 camera.yawRadians = glm::radians(-90.0f);
                 camera.pitchRadians = 0.0f;
             }
+            // Sample animation clips into joint LocalTransforms before the
+            // hierarchy resolve so the animated pose flows through.
+            world.updateAnimations(assets, dt);
+
+            // Advance physics before recomputing world transforms so dynamic
+            // bodies' new local poses flow into their WorldTransform the same
+            // frame. A no-op until a scene authors RigidBody/CharacterController
+            // components (the views are empty otherwise).
+            physics.update(world, dt);
 
             // Sync the listener entity to the fly camera before transforms are
             // recomputed, then run the audio system off the fresh hierarchy.

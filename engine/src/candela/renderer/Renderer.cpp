@@ -119,6 +119,18 @@ struct ShadowPush {
     VkDeviceAddress vertices;
 };
 
+// Compute pre-skinning push (fresh 128-byte budget, BDA pointers). Must match
+// skinning.slang's SkinningPush.
+struct SkinningPush {
+    VkDeviceAddress bindPoseVertices;
+    VkDeviceAddress skinVertices;
+    VkDeviceAddress palette;
+    VkDeviceAddress skinnedVertices;
+    uint32_t vertexCount;
+    uint32_t pad0, pad1, pad2;
+};
+static_assert(sizeof(SkinningPush) == 48, "SkinningPush must fit push budget");
+
 struct LightingPush {
     VkDeviceAddress frame;
     uint32_t gbAlbedo;
@@ -326,6 +338,10 @@ Renderer::Renderer(Window& window) : m_window(window) {
         CD_INFO("Ray tracing enabled (acceleration structures + ray queries)");
     }
 
+    // Skinning works without ray tracing (raster + compute); the BLAS refit is
+    // separately RT-gated inside the frame.
+    createSkinningResources();
+
     std::error_code ec;
     m_shaderTimestamp = std::filesystem::file_time_type{};
     for (const auto& entry :
@@ -436,6 +452,33 @@ void Renderer::createRayTracingResources() {
     }
 }
 
+void Renderer::createSkinningResources() {
+    const VkBufferUsageFlags skinnedUsage =
+        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+        (m_rtSupported
+             ? VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR
+             : 0);
+    for (FrameData& frame : m_frames) {
+        frame.skinnedVertices = createBuffer(
+            *m_context, VkDeviceSize(kMaxSkinnedVertices) * sizeof(Vertex),
+            skinnedUsage);
+
+        frame.jointPalette = createBuffer(
+            *m_context, VkDeviceSize(kMaxJointMatrices) * sizeof(glm::mat4),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        VmaAllocationInfo info{};
+        vmaGetAllocationInfo(m_context->allocator(),
+                             frame.jointPalette.allocation, &info);
+        frame.jointPaletteMapped = info.pMappedData;
+        // blasRefitScratch is grown lazily in fillSkinningData once we know the
+        // largest UPDATE scratch requirement among this frame's skinned meshes.
+    }
+}
+
 uint32_t Renderer::fillRayTracingInstances(FrameData& frame, World& world,
                                            AssetRegistry& assets) {
     ZoneScoped;
@@ -482,6 +525,51 @@ uint32_t Renderer::fillRayTracingInstances(FrameData& frame, World& world,
             entry.metallicFactor = primitive.metallicFactor;
             entry.roughnessFactor = primitive.roughnessFactor;
             entry.baseColorFactor = primitive.baseColorFactor;
+        }
+    }
+
+    // Skinned instances: one TLAS instance per skinned mesh instance, its
+    // per-geometry InstanceData pointed at the pre-skinned vertex sub-ranges so
+    // RT hit shading reads the animated positions/UVs.
+    for (const SkinnedRefit& refit : m_skinnedRefits) {
+        const GpuMesh& gpuMesh = *refit.mesh;
+        if (gpuMesh.blas == VK_NULL_HANDLE || instanceCount >= kMaxRTInstances ||
+            dataCount + gpuMesh.primitives.size() > kMaxRTInstanceData ||
+            refit.firstDraw >= m_skinnedDraws.size()) {
+            continue;
+        }
+        const glm::mat4& m = m_skinnedDraws[refit.firstDraw].transform;
+
+        VkAccelerationStructureInstanceKHR& instance =
+            instances[instanceCount++];
+        instance = {};
+        for (int row = 0; row < 3; ++row) {
+            for (int col = 0; col < 4; ++col) {
+                instance.transform.matrix[row][col] = m[col][row];
+            }
+        }
+        instance.instanceCustomIndex = dataCount;
+        instance.mask = 0xFF;
+        instance.flags =
+            VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
+        instance.accelerationStructureReference = gpuMesh.blasAddress;
+
+        uint32_t drawIdx = refit.firstDraw;
+        for (const GpuPrimitive& primitive : gpuMesh.primitives) {
+            InstanceDataGPU& entry = data[dataCount++];
+            entry.vertices =
+                (primitive.skinned && drawIdx < m_skinnedDraws.size())
+                    ? m_skinnedDraws[drawIdx].skinnedVertices
+                    : primitive.vertexBuffer.deviceAddress;
+            entry.indices = primitive.indexBuffer.deviceAddress;
+            entry.albedoTexture = primitive.albedoTexture;
+            entry.flags = primitive.flags;
+            entry.metallicFactor = primitive.metallicFactor;
+            entry.roughnessFactor = primitive.roughnessFactor;
+            entry.baseColorFactor = primitive.baseColorFactor;
+            if (primitive.skinned) {
+                ++drawIdx;
+            }
         }
     }
     return instanceCount;
@@ -532,6 +620,198 @@ void Renderer::buildTLAS(VkCommandBuffer cmd, FrameData& frame,
     vkCmdPipelineBarrier2(cmd, &dependency);
 }
 
+void Renderer::fillSkinningData(FrameData& frame, World& world,
+                                AssetRegistry& assets) {
+    ZoneScoped;
+    m_skinnedDraws.clear();
+    m_skinnedRefits.clear();
+    if (frame.jointPaletteMapped == nullptr) {
+        return;
+    }
+
+    auto* palette = static_cast<glm::mat4*>(frame.jointPaletteMapped);
+    const VkDeviceAddress skinnedBase = frame.skinnedVertices.deviceAddress;
+    const VkDeviceAddress paletteBaseAddr = frame.jointPalette.deviceAddress;
+    uint32_t vertexCursor = 0;
+    uint32_t paletteCursor = 0;
+
+    for (auto [entity, transform, smr, skeleton] :
+         world.registry.view<WorldTransform, SkinnedMeshRenderer, Skeleton>()
+             .each()) {
+        const ModelAsset* model = assets.tryGetModel(smr.model);
+        if (model == nullptr || smr.meshIndex >= model->meshes.size()) {
+            continue;
+        }
+        const GpuMesh& mesh = model->meshes[smr.meshIndex];
+        if (mesh.primitives.empty()) {
+            continue;
+        }
+        const auto jointCount = static_cast<uint32_t>(skeleton.joints.size());
+        if (paletteCursor + jointCount > kMaxJointMatrices) {
+            continue;
+        }
+
+        // Palette[j] = inverse(meshWorld) * world(joint[j]) * inverseBind[j].
+        // Folding inverse(meshWorld) in makes the skinned output mesh-local, so
+        // the G-buffer VS and the RT instance transform both apply meshWorld
+        // once — raster and RT geometry stay identical.
+        const glm::mat4 invMeshWorld = glm::inverse(transform.value);
+        const uint32_t paletteBase = paletteCursor;
+        for (uint32_t j = 0; j < jointCount; ++j) {
+            glm::mat4 jointWorld(1.0f);
+            const entt::entity je = skeleton.joints[j];
+            if (je != entt::null && world.registry.valid(je) &&
+                world.registry.all_of<WorldTransform>(je)) {
+                jointWorld = world.registry.get<WorldTransform>(je).value;
+            }
+            const glm::mat4 inverseBind = j < skeleton.inverseBind.size()
+                                              ? skeleton.inverseBind[j]
+                                              : glm::mat4(1.0f);
+            palette[paletteBase + j] = invMeshWorld * jointWorld * inverseBind;
+        }
+        paletteCursor += jointCount;
+        const VkDeviceAddress paletteAddr =
+            paletteBaseAddr + VkDeviceSize(paletteBase) * sizeof(glm::mat4);
+
+        const uint32_t entityId = static_cast<uint32_t>(entity) + 1;
+        const auto firstDraw = static_cast<uint32_t>(m_skinnedDraws.size());
+        uint32_t drawCount = 0;
+        for (const GpuPrimitive& primitive : mesh.primitives) {
+            if (!primitive.skinned) {
+                continue;
+            }
+            if (vertexCursor + primitive.vertexCount > kMaxSkinnedVertices) {
+                break; // ring exhausted this frame
+            }
+            const VkDeviceAddress dstAddr =
+                skinnedBase + VkDeviceSize(vertexCursor) * sizeof(Vertex);
+            // Deforming geometry doesn't cull cleanly against bind-pose bounds;
+            // v1 always draws skinned meshes (few of them). Frustum culling of
+            // animated bounds is a follow-up.
+            m_skinnedDraws.push_back({transform.value, &primitive, dstAddr,
+                                      paletteAddr, entityId, /*visible=*/true});
+            vertexCursor += primitive.vertexCount;
+            ++drawCount;
+        }
+        if (drawCount > 0) {
+            m_skinnedRefits.push_back({&mesh, firstDraw, drawCount});
+        }
+    }
+
+    // Grow the BLAS refit scratch to the largest UPDATE requirement this frame.
+    // Safe to reallocate here: the frame's fence has already cleared.
+    if (m_rtSupported) {
+        VkDeviceSize needed = 0;
+        for (const SkinnedRefit& refit : m_skinnedRefits) {
+            needed = (std::max)(needed, refit.mesh->blasScratchSize);
+        }
+        if (needed > 0) {
+            const VkDeviceSize want = needed + m_context->scratchAlignment();
+            if (frame.blasRefitScratch.buffer == VK_NULL_HANDLE ||
+                frame.blasRefitScratch.size < want) {
+                destroyBuffer(*m_context, frame.blasRefitScratch);
+                frame.blasRefitScratch = createBuffer(
+                    *m_context, want,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            }
+        }
+    }
+}
+
+void Renderer::refitSkinnedBlas(VkCommandBuffer cmd, FrameData& frame) {
+    if (frame.blasRefitScratch.buffer == VK_NULL_HANDLE) {
+        return;
+    }
+    const VkDeviceAddress alignment = m_context->scratchAlignment();
+    const VkDeviceAddress scratchAddr =
+        (frame.blasRefitScratch.deviceAddress + alignment - 1) &
+        ~(alignment - 1);
+
+    for (const SkinnedRefit& refit : m_skinnedRefits) {
+        const GpuMesh& mesh = *refit.mesh;
+        if (mesh.blas == VK_NULL_HANDLE) {
+            continue;
+        }
+
+        // Geometry order must match the import-time build (one geometry per
+        // primitive, in mesh order); skinned primitives supply their skinned
+        // sub-range as the vertex source.
+        std::vector<VkAccelerationStructureGeometryKHR> geometries;
+        std::vector<VkAccelerationStructureBuildRangeInfoKHR> ranges;
+        geometries.reserve(mesh.primitives.size());
+        ranges.reserve(mesh.primitives.size());
+        uint32_t drawIdx = refit.firstDraw;
+        for (const GpuPrimitive& primitive : mesh.primitives) {
+            VkAccelerationStructureGeometryKHR geometry{};
+            geometry.sType =
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            geometry.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            geometry.flags = (primitive.flags & DrawFlags::kAlphaMask)
+                                 ? 0
+                                 : VK_GEOMETRY_OPAQUE_BIT_KHR;
+            auto& triangles = geometry.geometry.triangles;
+            triangles.sType =
+                VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            triangles.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            triangles.vertexData.deviceAddress =
+                (primitive.skinned && drawIdx < m_skinnedDraws.size())
+                    ? m_skinnedDraws[drawIdx].skinnedVertices
+                    : primitive.vertexBuffer.deviceAddress;
+            triangles.vertexStride = sizeof(Vertex);
+            triangles.maxVertex = primitive.vertexCount - 1;
+            triangles.indexType = VK_INDEX_TYPE_UINT32;
+            triangles.indexData.deviceAddress =
+                primitive.indexBuffer.deviceAddress;
+            geometries.push_back(geometry);
+
+            VkAccelerationStructureBuildRangeInfoKHR range{};
+            range.primitiveCount = primitive.indexCount / 3;
+            ranges.push_back(range);
+            if (primitive.skinned) {
+                ++drawIdx;
+            }
+        }
+
+        VkAccelerationStructureBuildGeometryInfoKHR buildInfo{};
+        buildInfo.sType =
+            VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+        buildInfo.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+        buildInfo.flags =
+            VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+            VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+        buildInfo.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+        buildInfo.srcAccelerationStructure = mesh.blas;
+        buildInfo.dstAccelerationStructure = mesh.blas;
+        buildInfo.geometryCount = static_cast<uint32_t>(geometries.size());
+        buildInfo.pGeometries = geometries.data();
+        buildInfo.scratchData.deviceAddress = scratchAddr;
+
+        const VkAccelerationStructureBuildRangeInfoKHR* rangePtr = ranges.data();
+        vkCmdBuildAccelerationStructuresKHR(cmd, 1, &buildInfo, &rangePtr);
+
+        // The single shared scratch region forces refits to serialize; a
+        // barrier between builds both enforces that and (on the last build)
+        // publishes the updated BLAS to the following TLAS build.
+        VkMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask =
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        barrier.srcAccessMask =
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        barrier.dstStageMask =
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        barrier.dstAccessMask =
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+        VkDependencyInfo dependency{};
+        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+    }
+}
+
 Renderer::~Renderer() {
     m_context->waitIdle();
 
@@ -559,7 +839,8 @@ Renderer::~Renderer() {
     for (VkPipeline pipeline :
          {m_gbufferPipeline, m_shadowPipeline, m_lightingPipeline,
           m_bloomDownPipeline, m_bloomUpPipeline, m_tonemapPipeline,
-          m_reflectionsPipeline, m_aoPipeline, m_temporalPipeline}) {
+          m_skinningPipeline, m_reflectionsPipeline, m_aoPipeline,
+          m_temporalPipeline}) {
         if (pipeline != VK_NULL_HANDLE) {
             vkDestroyPipeline(device, pipeline, nullptr);
         }
@@ -648,6 +929,9 @@ void Renderer::destroyFrameData() {
             destroyBuffer(*m_context, frame.instanceData);
         }
         destroyBuffer(*m_context, frame.constants);
+        destroyBuffer(*m_context, frame.skinnedVertices);
+        destroyBuffer(*m_context, frame.jointPalette);
+        destroyBuffer(*m_context, frame.blasRefitScratch);
         destroyBuffer(*m_context, frame.screenshotBuffer);
         vkDestroyQueryPool(device, frame.queryPool, nullptr);
         vkDestroyFence(device, frame.inFlightFence, nullptr);
@@ -874,20 +1158,23 @@ bool Renderer::createPipelines() {
     tonemap.fsEntry = "fsMain";
     tonemap.colorFormats = {m_swapchain->format()};
 
-    VkPipeline newPipelines[9] = {
+    VkPipeline newPipelines[10] = {
         buildPipeline(gbuffer),
         buildPipeline(shadow),
         buildPipeline(lighting),
         buildPipeline(bloomDown),
         buildPipeline(bloomUp),
         buildPipeline(tonemap),
+        buildComputePipeline("skinning.slang", "csMain"),
         buildComputePipeline("temporal.slang", "csMain"),
         m_rtSupported ? buildComputePipeline("reflections.slang", "csMain")
                       : VK_NULL_HANDLE,
         m_rtSupported ? buildComputePipeline("ao.slang", "csMain")
                       : VK_NULL_HANDLE,
     };
-    const uint32_t required = m_rtSupported ? 9u : 7u;
+    // Skinning + temporal are always built; the two RT-gated compute slots stay
+    // last so they can be null without ray tracing.
+    const uint32_t required = m_rtSupported ? 10u : 8u;
     for (uint32_t i = 0; i < required; ++i) {
         if (newPipelines[i] == VK_NULL_HANDLE) {
             for (VkPipeline created : newPipelines) {
@@ -899,12 +1186,12 @@ bool Renderer::createPipelines() {
         }
     }
 
-    VkPipeline* slots[9] = {&m_gbufferPipeline,   &m_shadowPipeline,
-                            &m_lightingPipeline,  &m_bloomDownPipeline,
-                            &m_bloomUpPipeline,   &m_tonemapPipeline,
-                            &m_temporalPipeline,  &m_reflectionsPipeline,
-                            &m_aoPipeline};
-    for (uint32_t i = 0; i < 9; ++i) {
+    VkPipeline* slots[10] = {&m_gbufferPipeline,   &m_shadowPipeline,
+                             &m_lightingPipeline,  &m_bloomDownPipeline,
+                             &m_bloomUpPipeline,   &m_tonemapPipeline,
+                             &m_skinningPipeline,  &m_temporalPipeline,
+                             &m_reflectionsPipeline, &m_aoPipeline};
+    for (uint32_t i = 0; i < 10; ++i) {
         if (*slots[i] != VK_NULL_HANDLE) {
             vkDestroyPipeline(m_context->device(), *slots[i], nullptr);
         }
@@ -1133,12 +1420,63 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
     timestamps.pool = frame.queryPool;
     timestamps.capacity = kMaxTimestampQueries;
 
+    // --- Skeletal skinning: pre-skin every skinned instance into the frame's
+    // vertex ring on the raw cmd. The render graph tracks image barriers only,
+    // so the skinned buffer's compute→VS/AS-build hazard is handled here (the
+    // same place fillRayTracingInstances/buildTLAS already live). ---
+    if (!m_skinnedDraws.empty() && m_skinningPipeline != VK_NULL_HANDLE) {
+        TracyVkZone(m_tracyCtx, cmd, "skinning");
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                             timestamps.pool, timestamps.next);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          m_skinningPipeline);
+        VkDescriptorSet skinSet = m_bindless->set();
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                m_pipelineLayout, 0, 1, &skinSet, 0, nullptr);
+        for (const SkinnedDraw& draw : m_skinnedDraws) {
+            SkinningPush push{};
+            push.bindPoseVertices = draw.primitive->vertexBuffer.deviceAddress;
+            push.skinVertices = draw.primitive->skinVertexBuffer.deviceAddress;
+            push.palette = draw.palette;
+            push.skinnedVertices = draw.skinnedVertices;
+            push.vertexCount = draw.primitive->vertexCount;
+            vkCmdPushConstants(cmd, m_pipelineLayout, kPushStages, 0,
+                               sizeof(push), &push);
+            vkCmdDispatch(cmd, (draw.primitive->vertexCount + 63) / 64, 1, 1);
+        }
+        vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT,
+                             timestamps.pool, timestamps.next + 1);
+        timestamps.names.push_back("skinning");
+        timestamps.next += 2;
+
+        // Compute writes → G-buffer/shadow VS reads + BLAS-refit reads.
+        VkMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier.dstStageMask =
+            VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT |
+            VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+        barrier.dstAccessMask =
+            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+            VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+        VkDependencyInfo dependency{};
+        dependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dependency.memoryBarrierCount = 1;
+        dependency.pMemoryBarriers = &barrier;
+        vkCmdPipelineBarrier2(cmd, &dependency);
+    }
+
     // TLAS rebuild (cheap at this instance count; prepared in drawFrame).
     const bool rtActive = m_rtSupported && m_rtInstanceCount > 0 &&
                           (world.settings.rtShadows ||
                            world.settings.rtAmbientOcclusion ||
                            world.settings.rtReflections);
     if (rtActive) {
+        // Refit skinned meshes' BLAS from the freshly skinned vertices so RT
+        // shadows/AO/reflections track the animation, before the TLAS build
+        // consumes the updated BLAS addresses.
+        refitSkinnedBlas(cmd, frame);
         TracyVkZone(m_tracyCtx, cmd, "tlas-build");
         vkCmdWriteTimestamp2(cmd, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
                              timestamps.pool, timestamps.next);
@@ -1296,6 +1634,19 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 vkCmdDrawIndexed(passCmd, draw.primitive->indexCount, 1, 0, 0,
                                  0);
             }
+            // Skinned casters draw from the pre-skinned buffer.
+            for (const SkinnedDraw& draw : m_skinnedDraws) {
+                ShadowPush push{};
+                push.lightViewProjModel = cascadeMatrix * draw.transform;
+                push.vertices = draw.skinnedVertices;
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
+                                   0, sizeof(push), &push);
+                vkCmdBindIndexBuffer(passCmd,
+                                     draw.primitive->indexBuffer.buffer, 0,
+                                     VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(passCmd, draw.primitive->indexCount, 1, 0, 0,
+                                 0);
+            }
         };
         graph.addPass(std::move(pass));
     }
@@ -1331,6 +1682,37 @@ void Renderer::recordCommands(VkCommandBuffer cmd, uint32_t imageIndex,
                 GBufferPush push{};
                 push.model = draw.transform;
                 push.vertices = primitive.vertexBuffer.deviceAddress;
+                push.frame = frameAddress;
+                push.albedoNormalTex = packU16x2(primitive.albedoTexture,
+                                                 primitive.normalTexture);
+                push.mrOcclusionTex =
+                    packU16x2(primitive.metallicRoughnessTexture,
+                              primitive.occlusionTexture);
+                push.emissiveTexFlags =
+                    packU16x2(primitive.emissiveTexture, primitive.flags);
+                push.metallicRoughness = packUnorm16x2(
+                    primitive.metallicFactor, primitive.roughnessFactor);
+                push.emissiveFactorPacked =
+                    packUnorm8x3(primitive.emissiveFactor);
+                push.entityId = draw.entityId;
+                push.baseColorFactor = primitive.baseColorFactor;
+                vkCmdPushConstants(passCmd, m_pipelineLayout, kPushStages,
+                                   0, sizeof(push), &push);
+                vkCmdBindIndexBuffer(passCmd, primitive.indexBuffer.buffer, 0,
+                                     VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(passCmd, primitive.indexCount, 1, 0, 0, 0);
+            }
+            // Skinned meshes reuse the same pipeline; only the vertex source
+            // changes (bind pose → pre-skinned buffer). GBufferPush is
+            // untouched (still 128 B) — we just point .vertices elsewhere.
+            for (const SkinnedDraw& draw : m_skinnedDraws) {
+                if (!draw.visible) {
+                    continue;
+                }
+                const GpuPrimitive& primitive = *draw.primitive;
+                GBufferPush push{};
+                push.model = draw.transform;
+                push.vertices = draw.skinnedVertices;
                 push.frame = frameAddress;
                 push.albedoNormalTex = packU16x2(primitive.albedoTexture,
                                                  primitive.normalTexture);
@@ -1891,7 +2273,10 @@ void Renderer::drawFrame(const Camera& camera, World& world,
     VK_CHECK(vkWaitForFences(device, 1, &frame.inFlightFence, VK_TRUE,
                              UINT64_MAX));
 
-    // Safe to write this frame slot's RT buffers now that its fence cleared.
+    // Safe to write this frame slot's mapped buffers now that its fence
+    // cleared. Skinning first: fillRayTracingInstances appends skinned
+    // instances using the palettes/addresses it computes.
+    fillSkinningData(frame, world, assets);
     m_rtInstanceCount =
         m_rtSupported ? fillRayTracingInstances(frame, world, assets) : 0;
     m_stats.rtInstances = m_rtInstanceCount;

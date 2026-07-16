@@ -20,6 +20,11 @@ public:
     entt::entity createEntity(const std::string& name);
     void setParent(entt::entity child, entt::entity parent);
 
+    // Advances every Animator, samples its clip, and writes the sampled TRS
+    // into each targeted joint entity's LocalTransform. MUST run before
+    // updateTransforms() so the animated pose flows through the hierarchy.
+    void updateAnimations(AssetRegistry& assets, float dt);
+
     // Recomputes every WorldTransform from the LocalTransform/Parent
     // hierarchy. O(n) memoized recursion; dirty-flag propagation is a
     // profiling-driven upgrade once scenes get large.

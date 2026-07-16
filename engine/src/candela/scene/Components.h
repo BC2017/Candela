@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace candela {
 
@@ -36,6 +37,35 @@ struct WorldTransform {
 struct MeshRenderer {
     AssetGuid model = kInvalidGuid;
     uint32_t meshIndex = 0;
+};
+
+// A skinned mesh instance. Lives on the node entity that carried a skinIndex,
+// alongside a Skeleton (and usually an Animator). The renderer pre-skins it
+// into a per-frame buffer instead of drawing the bind pose.
+struct SkinnedMeshRenderer {
+    AssetGuid model = kInvalidGuid;
+    uint32_t meshIndex = 0;
+    int skinIndex = -1; // index into ModelAsset::skins
+};
+
+// The joint entities driving a SkinnedMeshRenderer, in palette order. joints[j]
+// is the entity whose WorldTransform gives joint j's world matrix; inverseBind
+// and jointNodeIndex are parallel arrays. jointNodeIndex maps each joint to its
+// model node index so the animator can resolve channel targets.
+struct Skeleton {
+    std::vector<entt::entity> joints;
+    std::vector<glm::mat4> inverseBind;
+    std::vector<int> jointNodeIndex;
+};
+
+// Drives one clip on the skeleton this entity owns.
+struct Animator {
+    AssetGuid model = kInvalidGuid;
+    int clip = 0;    // index into ModelAsset::animations
+    float time = 0.0f;
+    float speed = 1.0f;
+    bool loop = true;
+    bool playing = true;
 };
 
 struct PointLightComponent {
@@ -74,6 +104,48 @@ struct AudioSource {
     // Runtime state (not serialized).
     uint32_t instance = 0; // AudioEngine::InstanceId; 0 = not started
     bool started = false;
+};
+
+// --- Physics (Jolt-backed; see physics/PhysicsSystem.h). Runtime handles are
+// opaque integers so this header never includes Jolt. -----------------------
+
+// Sentinel matching JPH::BodyID::cInvalidBodyID without pulling in Jolt.
+inline constexpr uint32_t kInvalidBodyId = 0xffffffffu;
+
+// A rigid body simulated by the PhysicsSystem. Static/kinematic bodies are
+// world geometry; dynamic bodies have their pose written back to
+// LocalTransform each frame.
+struct RigidBody {
+    enum class MotionType : uint8_t { Static, Kinematic, Dynamic };
+    enum class ShapeType : uint8_t { Box, Sphere, Capsule };
+
+    MotionType motionType = MotionType::Dynamic;
+    ShapeType shape = ShapeType::Box;
+
+    // Box    -> halfExtents (x, y, z).
+    // Sphere -> radius = halfExtents.x.
+    // Capsule-> radius = halfExtents.x, half cylinder height = halfExtents.y.
+    glm::vec3 halfExtents{0.5f};
+
+    float mass = 1.0f; // ignored for Static/Kinematic
+    float friction = 0.5f;
+    float restitution = 0.0f;
+
+    // Runtime — assigned by PhysicsSystem on first update; never authored or
+    // serialized.
+    uint32_t bodyId = kInvalidBodyId;
+};
+
+// A capsule character controller (the player). The backing JPH::Character
+// lives in the PhysicsSystem; its pose is synced back to LocalTransform.
+struct CharacterController {
+    float radius = 0.3f;     // capsule radius
+    float halfHeight = 0.6f; // half height of the cylindrical section
+    float mass = 75.0f;
+    float friction = 0.5f;
+
+    // Runtime — the backing body's id; never authored or serialized.
+    uint32_t bodyId = kInvalidBodyId;
 };
 
 // Per-scene lighting/environment settings, stored in registry context.
