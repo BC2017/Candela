@@ -93,7 +93,6 @@ FetchContent_Declare(miniaudio
   GIT_SHALLOW ON
   SOURCE_SUBDIR does-not-exist)
 
-FetchContent_MakeAvailable(volk vkbootstrap vma glfw glm spdlog tracy fastgltf stb
 # Jolt Physics. Its buildable CMakeLists lives under Build/, hence
 # SOURCE_SUBDIR. All ABI-affecting JPH_* defines are carried by the exported
 # `Jolt` target's INTERFACE_COMPILE_DEFINITIONS and inherited automatically by
