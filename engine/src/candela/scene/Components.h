@@ -144,6 +144,14 @@ struct CharacterController {
     float mass = 75.0f;
     float friction = 0.5f;
 
+    // Runtime input: desired horizontal velocity in m/s. The PhysicsSystem
+    // drives the capsule from this each fixed step; gravity owns the vertical
+    // axis. Set it from player/AI input each frame. Never serialized.
+    glm::vec3 desiredVelocity{0.0f};
+
+    // Runtime output: true while the capsule is standing on the ground.
+    bool onGround = false;
+
     // Runtime — the backing body's id; never authored or serialized.
     uint32_t bodyId = kInvalidBodyId;
 };

@@ -313,6 +313,17 @@ void PhysicsSystem::update(World& world, float dt) {
         impl_->accumulator = maxAccum;
     }
     while (impl_->accumulator >= kFixedDelta) {
+        // Drive each character from its desired horizontal velocity; gravity
+        // owns the vertical component (ground contact arrests it in-step).
+        for (auto& [entity, character] : impl_->characters) {
+            if (!reg.valid(entity) || !reg.all_of<CharacterController>(entity)) {
+                continue;
+            }
+            const glm::vec3 dv =
+                reg.get<CharacterController>(entity).desiredVelocity;
+            const JPH::Vec3 cur = character->GetLinearVelocity();
+            character->SetLinearVelocity(JPH::Vec3(dv.x, cur.GetY(), dv.z));
+        }
         impl_->physics.Update(kFixedDelta, /*collisionSteps*/ 1,
                               &impl_->tempAllocator, &impl_->jobSystem);
         for (auto& [entity, character] : impl_->characters) {
@@ -340,6 +351,11 @@ void PhysicsSystem::update(World& world, float dt) {
         LocalTransform& lt = reg.get<LocalTransform>(entity);
         lt.translation = toGlm(character->GetPosition());
         lt.rotation = toGlm(character->GetRotation());
+        if (reg.all_of<CharacterController>(entity)) {
+            reg.get<CharacterController>(entity).onGround =
+                character->GetGroundState() ==
+                JPH::CharacterBase::EGroundState::OnGround;
+        }
     }
 }
 
